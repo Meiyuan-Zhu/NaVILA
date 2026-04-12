@@ -28,6 +28,7 @@ from vlnce_baselines.common.aux_losses import AuxLosses
 from vlnce_baselines.common.base_il_trainer import BaseVLNCETrainer
 from vlnce_baselines.common.env_utils import construct_envs, construct_envs_auto_reset_false
 from vlnce_baselines.common.utils import extract_instruction_tokens
+from vlnce_baselines.memory_modules import CandidateAMemoryManager
 
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import SeparatorStyle, conv_templates
@@ -50,6 +51,49 @@ def sample_and_pad_images(images, num_frames=8, width=512, height=512):
     sampled_frames = [frames[i] for i in sampled_indices] + [latest_frame]
 
     return sampled_frames
+
+
+def _format_memory_debug(step_id, episode_id, debug_info, include_scores=True):
+    selected = debug_info.get("selected_indices", [])
+    fallback = debug_info.get("fallback")
+    state = debug_info.get("state", {})
+    trace = debug_info.get("trace", "")
+
+    parts = [
+        f"[CandidateA][ep={episode_id}][step={step_id}]",
+        f"selected_history_indices={selected}",
+    ]
+    if fallback is not None:
+        parts.append(f"fallback={fallback}")
+
+    if state:
+        parts.append(
+            f"stage={state.get('current_subgoal_id', 0)} recent_actions={state.get('recent_actions', [])} "
+            f"last_milestone={state.get('last_milestone_text', '') or 'none'}"
+        )
+    if trace:
+        parts.append(f"trace={trace}")
+
+    if include_scores:
+        details = debug_info.get("score_details", {})
+        detail_chunks = []
+        for idx in selected:
+            payload = details.get(idx)
+            if payload is None:
+                continue
+            detail_chunks.append(
+                "idx={idx}:rel={rel:.3f},nov={nov:.3f},turn={turn:.3f},total={total:.3f},anchor={anchor}".format(
+                    idx=idx,
+                    rel=float(payload.get("rel", 0.0)),
+                    nov=float(payload.get("nov", 0.0)),
+                    turn=float(payload.get("turn", 0.0)),
+                    total=float(payload.get("total", 0.0)),
+                    anchor=bool(payload.get("anchor", False)),
+                )
+            )
+        if detail_chunks:
+            parts.append("scores={" + " | ".join(detail_chunks) + "}")
+    return " ".join(parts)
 
 
 @baseline_registry.register_trainer(name="navila")
@@ -145,14 +189,30 @@ class NaVILATrainer(BaseVLNCETrainer):
         assert envs.num_envs == 1
 
         queue_actions = []
+        memory_manager = None
+        memory_debug_once = False
+        current_episode_id = None
+        memory_cfg = config.MEMORY
+        use_candidate_a = bool(memory_cfg.ENABLE and memory_cfg.STRATEGY == "candidate_a")
+
+        if use_candidate_a:
+            memory_manager = CandidateAMemoryManager(memory_cfg)
+            logger.info("Candidate A memory manager enabled.")
+        else:
+            logger.info("Using baseline uniform memory sampler.")
 
         while envs.num_envs > 0 and len(stats_episodes) < num_eps:
 
             current_episodes = envs.current_episodes()
+            episode_id = current_episodes[0].episode_id
 
             if len(queue_actions) > 0:
                 print(f"using queue...{queue_actions[0]}")
-                outputs = envs.step([queue_actions[0]])
+                queued_action = queue_actions[0]
+                outputs = envs.step([queued_action])
+                if memory_manager is not None:
+                    turn_deg = 15.0 if queued_action in (2, 3) else 0.0
+                    memory_manager.update_after_action(action_id=queued_action, turn_deg=turn_deg)
                 queue_actions.pop(0)
                 print(f"queue length after using...{len(queue_actions)}")
 
@@ -160,12 +220,45 @@ class NaVILATrainer(BaseVLNCETrainer):
                 with torch.no_grad():
                     curr_rgb = Image.fromarray(np.uint8(batch[0]["rgb"].cpu().numpy())).convert("RGB")
 
-                    past_and_current_rgbs = past_rgbs[0] + [curr_rgb]
                     num_video_frames = model.config.num_video_frames
-
-                    past_and_current_rgbs = sample_and_pad_images(past_and_current_rgbs, num_frames=num_video_frames)
-
                     instruction = current_episodes[0].instruction.instruction_text
+
+                    if memory_manager is not None:
+                        if current_episode_id != episode_id:
+                            memory_manager.reset_episode(episode_id=episode_id, instruction=instruction)
+                            current_episode_id = episode_id
+                        try:
+                            past_and_current_rgbs, memory_debug = memory_manager.select_frames(
+                                history_frames=past_rgbs[0],
+                                current_frame=curr_rgb,
+                                instruction=instruction,
+                                num_frames=num_video_frames,
+                            )
+                            should_log = bool(memory_cfg.LOG_SELECTED_FRAMES) and (
+                                memory_manager.step_id == 1
+                                or (memory_manager.step_id % max(1, int(memory_cfg.LOG_INTERVAL)) == 0)
+                            )
+                            if should_log:
+                                logger.info(
+                                    _format_memory_debug(
+                                        memory_manager.step_id,
+                                        episode_id,
+                                        memory_debug,
+                                        include_scores=bool(memory_cfg.LOG_SCORES),
+                                    )
+                                )
+                        except Exception as memory_error:
+                            if not memory_debug_once:
+                                logger.warning(f"Candidate A selector failed, falling back to uniform sampler: {memory_error}")
+                                memory_debug_once = True
+                            past_and_current_rgbs = sample_and_pad_images(
+                                past_rgbs[0] + [curr_rgb], num_frames=num_video_frames
+                            )
+                    else:
+                        past_and_current_rgbs = sample_and_pad_images(
+                            past_rgbs[0] + [curr_rgb], num_frames=num_video_frames
+                        )
+
 
                     interleaved_images = "<image>\n" * (len(past_and_current_rgbs) - 1)
 
@@ -217,6 +310,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                         outputs = outputs[: -len(stop_str)]
                     outputs = outputs.strip()
                     print(outputs)
+                    logger.info(f"[ActionText][ep={episode_id}] {outputs}")
 
                     # Define the regex patterns for each action
                     patterns = {
@@ -238,6 +332,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                     except:
                         actions = [1]
                     print(actions)
+                    logger.info(f"[ActionID][ep={episode_id}] {actions}")
 
                 if actions[0] == 1:
                     try:
@@ -248,6 +343,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                     if (distance % 25) != 0:
                         distance = min([25, 50, 75], key=lambda x: abs(x - distance))
                     outputs = envs.step([1])
+                    if memory_manager is not None:
+                        memory_manager.update_after_action(action_id=1, turn_deg=0.0)
 
                     for _ in range(int(distance // 25) - 1):
                         queue_actions.append(1)
@@ -261,6 +358,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                     if (degree % 15) != 0:
                         degree = min([15, 30, 45], key=lambda x: abs(x - degree))
                     outputs = envs.step([2])
+                    if memory_manager is not None:
+                        memory_manager.update_after_action(action_id=2, turn_deg=15.0)
 
                     for _ in range(int(degree // 15) - 1):
                         queue_actions.append(2)
@@ -275,12 +374,16 @@ class NaVILATrainer(BaseVLNCETrainer):
                     if (degree % 15) != 0:
                         degree = min([15, 30, 45], key=lambda x: abs(x - degree))
                     outputs = envs.step([3])
+                    if memory_manager is not None:
+                        memory_manager.update_after_action(action_id=3, turn_deg=15.0)
 
                     for _ in range(int(degree // 15) - 1):
                         queue_actions.append(3)
 
                 else:  # 0, stop
                     outputs = envs.step(actions)
+                    if memory_manager is not None:
+                        memory_manager.update_after_action(action_id=0, turn_deg=0.0)
 
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
 
@@ -300,6 +403,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                 stats_episodes[ep_id] = infos[i]
                 observations[i] = envs.reset_at(i)[0]
                 past_rgbs[i] = []
+                if memory_manager is not None and i == 0:
+                    current_episode_id = None
 
                 if config.use_pbar:
                     pbar.update()

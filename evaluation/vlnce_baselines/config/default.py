@@ -51,6 +51,32 @@ _C.INFERENCE.NONLEARNING.AGENT = "RandomAgent"
 _C.INFERENCE.FORMAT = "rxr"  # either 'rxr' or 'r2r'
 
 # ----------------------------------------------------------------------------
+# MEMORY OPTIMIZATION CONFIG (Candidate A MVP)
+# ----------------------------------------------------------------------------
+_C.MEMORY = CN()
+_C.MEMORY.ENABLE = False
+_C.MEMORY.STRATEGY = "uniform"  # options: uniform, candidate_a
+_C.MEMORY.BUDGET_K = 8
+_C.MEMORY.LOG_SELECTED_FRAMES = True
+_C.MEMORY.LOG_SCORES = False
+_C.MEMORY.LOG_INTERVAL = 10
+_C.MEMORY.USE_SUBGOAL_PARSER = False
+_C.MEMORY.SUBGOAL_CACHE_DIR = "evaluation/data/subgoal_cache"
+_C.MEMORY.USE_TRAJECTORY_TRACE = False
+_C.MEMORY.TURN_THRESHOLD_DEGREES = 15.0
+
+_C.MEMORY.WEIGHTS = CN()
+_C.MEMORY.WEIGHTS.RELEVANCE = 1.0
+_C.MEMORY.WEIGHTS.NOVELTY = 1.0
+_C.MEMORY.WEIGHTS.TURN_BONUS = 0.5
+
+_C.MEMORY.BUFFER = CN()
+_C.MEMORY.BUFFER.MAX_HISTORY_FRAMES = 256
+
+_C.MEMORY.STATE = CN()
+_C.MEMORY.STATE.MAX_RECENT_ACTIONS = 8
+
+# ----------------------------------------------------------------------------
 # IMITATION LEARNING CONFIG
 # ----------------------------------------------------------------------------
 _C.IL = CN()
