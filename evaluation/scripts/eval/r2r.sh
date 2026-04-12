@@ -1,4 +1,12 @@
 #!/bin/bash
+set -euo pipefail
+
+# Headless Habitat-Sim still uses EGL for GPU rendering.
+unset DISPLAY
+export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-$HOME/nvidia-egl.json}
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+export EGL_LOG_LEVEL=${EGL_LOG_LEVEL:-error}
+export PYTHONFAULTHANDLER=1
 
 MODEL_PATH=$1
 TOTAL_CHUNKS=$2
