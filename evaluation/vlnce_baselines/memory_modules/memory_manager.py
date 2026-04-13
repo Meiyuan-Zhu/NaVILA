@@ -66,6 +66,7 @@ class CandidateAMemoryManager:
         self._cached_hist_len = 0
         self._fallback_warned = False
         self.parser_source = "rule"
+        self._instruction_embed_cache: Dict[str, np.ndarray] = {}
 
     def reset_episode(self, episode_id: str, instruction: str):
         subgoals = self.parser.parse_one_shot(instruction)
@@ -76,6 +77,33 @@ class CandidateAMemoryManager:
         self.frame_meta.clear()
         self.history_feats = []
         self._cached_hist_len = 0
+        self._instruction_embed_cache = {}
+
+    @staticmethod
+    def _cosine_with_safe_norm(a: np.ndarray, b: np.ndarray) -> float:
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+        return float(np.dot(a, b) / denom)
+
+    def _get_instruction_embedding(self, instruction: str, target_dim: int) -> np.ndarray:
+        key = f"{instruction}::{int(target_dim)}"
+        cached = self._instruction_embed_cache.get(key)
+        if cached is not None:
+            return cached
+
+        text_feat = self.scorer.compute_text_feature(instruction)
+        if int(target_dim) <= 0:
+            emb = text_feat.astype(np.float32)
+        elif int(target_dim) == text_feat.shape[0]:
+            emb = text_feat.astype(np.float32)
+        else:
+            repeat = int(np.ceil(float(target_dim) / float(max(1, text_feat.shape[0]))))
+            tiled = np.tile(text_feat, repeat)
+            emb = tiled[: int(target_dim)].astype(np.float32)
+            norm = np.linalg.norm(emb) + 1e-8
+            emb = emb / norm
+
+        self._instruction_embed_cache[key] = emb
+        return emb
 
     def update_after_action(self, action_id: int, turn_deg: float = 0.0, yaw_delta: Optional[float] = None):
         turn_value = float(yaw_delta) if yaw_delta is not None else float(turn_deg)
@@ -432,24 +460,171 @@ class CandidateAMemoryManager:
         initial_target = min(8, target_hist_slots)
         historical_target = max(0, target_hist_slots - initial_target)
 
+        deco_cfg = getattr(self.cfg, "DECO_REFINE", None)
+        deco_enabled = bool(
+            self.strategy_name == "candidate_b_v3"
+            and deco_cfg is not None
+            and bool(getattr(deco_cfg, "ENABLE", True))
+        )
+        if deco_enabled:
+            initial_target = min(int(getattr(deco_cfg, "INITIAL_WINDOW_SIZE", 8)), target_hist_slots)
+            historical_target = max(
+                0,
+                min(
+                    int(getattr(deco_cfg, "REFINED_HISTORY_SIZE", 7)),
+                    target_hist_slots - initial_target,
+                ),
+            )
+
         initial_indices = list(range(min(len(history), initial_target)))
 
         historical_indices: List[int] = []
+        score_details: Dict[int, Dict[str, float]] = {}
+        refined_score_breakdown: List[Dict[str, float]] = []
+        candidate_pool_indices: List[int] = []
+        evicted_indices: List[int] = []
         tail_start = initial_target
         if historical_target > 0 and len(history) > tail_start:
-            tail_indices = list(range(tail_start, len(history)))
-            if len(tail_indices) <= historical_target:
-                historical_indices = tail_indices
+            tail_indices_all = list(range(tail_start, len(history)))
+            if deco_enabled:
+                candidate_pool_max = max(1, int(getattr(deco_cfg, "CANDIDATE_POOL_MAX", 120)))
+                if len(tail_indices_all) > candidate_pool_max:
+                    evicted_indices = tail_indices_all[: len(tail_indices_all) - candidate_pool_max]
+                    candidate_pool_indices = tail_indices_all[-candidate_pool_max:]
+                else:
+                    candidate_pool_indices = tail_indices_all
+                lambda_r = float(getattr(deco_cfg, "LAMBDA_R", 0.65))
+                w_vis = float(getattr(deco_cfg, "W_VIS", 0.6))
+                w_temp = float(getattr(deco_cfg, "W_TEMP", 0.4))
+                epsilon = float(getattr(deco_cfg, "EPSILON", 1e-6))
+
+                if len(history) > self._cached_hist_len:
+                    new_frames = history[self._cached_hist_len :]
+                    self.history_feats.extend([self.scorer.compute_feature(img) for img in new_frames])
+                    self._cached_hist_len = len(history)
+                elif len(history) < self._cached_hist_len:
+                    self.history_feats = [self.scorer.compute_feature(img) for img in history]
+                    self._cached_hist_len = len(history)
+
+                if len(candidate_pool_indices) <= historical_target:
+                    historical_indices = list(candidate_pool_indices)
+                    if len(self.history_feats) > 0:
+                        text_embed = self._get_instruction_embedding(instruction, self.history_feats[0].shape[0])
+                        selected_feats: List[np.ndarray] = []
+                        selected_for_penalty: List[int] = []
+                        for idx in historical_indices:
+                            feat = self.history_feats[idx]
+                            sim_sem = self._cosine_with_safe_norm(feat, text_embed)
+                            if len(selected_feats) == 0:
+                                sim_vis = 0.0
+                                sim_temp = 0.0
+                            else:
+                                sim_vis = max(self._cosine_with_safe_norm(feat, x) for x in selected_feats)
+                                min_delta = min(abs(int(idx) - int(m)) for m in selected_for_penalty)
+                                sim_temp = 1.0 / (float(min_delta) + max(1e-8, epsilon))
+                            total = lambda_r * sim_sem - (1.0 - lambda_r) * (w_vis * sim_vis + w_temp * sim_temp)
+
+                            selected_feats.append(feat)
+                            selected_for_penalty.append(int(idx))
+
+                            payload = {
+                                "sim_sem": float(sim_sem),
+                                "sim_vis": float(sim_vis),
+                                "sim_temp": float(sim_temp),
+                                "total": float(total),
+                            }
+                            score_details[int(idx)] = {
+                                "rel": float(sim_sem),
+                                "nov": float(1.0 - max(0.0, min(1.0, 0.5 * (sim_vis + 1.0)))),
+                                "cov": float(sim_temp),
+                                "turn": 0.0,
+                                "total": float(total),
+                                "anchor": False,
+                            }
+                            refined_score_breakdown.append({"idx": int(idx), **payload})
+                else:
+                    if len(self.history_feats) == 0:
+                        sampled_tail = np.linspace(
+                            0,
+                            len(candidate_pool_indices) - 1,
+                            num=historical_target,
+                            dtype=int,
+                        ).tolist()
+                        historical_indices = sorted(set(candidate_pool_indices[i] for i in sampled_tail))
+                    else:
+                        text_embed = self._get_instruction_embedding(instruction, self.history_feats[0].shape[0])
+                        selected_for_penalty: List[int] = []
+                        selected_feats: List[np.ndarray] = []
+                        remaining = set(int(x) for x in candidate_pool_indices)
+
+                        while len(selected_for_penalty) < historical_target and len(remaining) > 0:
+                            best_idx = None
+                            best_score = -1e9
+                            best_payload = None
+
+                            for idx in remaining:
+                                feat = self.history_feats[int(idx)]
+                                sim_sem = self._cosine_with_safe_norm(feat, text_embed)
+                                if len(selected_feats) == 0:
+                                    sim_vis = 0.0
+                                    sim_temp = 0.0
+                                else:
+                                    sim_vis = max(self._cosine_with_safe_norm(feat, x) for x in selected_feats)
+                                    min_delta = min(abs(int(idx) - int(m)) for m in selected_for_penalty)
+                                    sim_temp = 1.0 / (float(min_delta) + max(1e-8, epsilon))
+
+                                total = lambda_r * sim_sem - (1.0 - lambda_r) * (w_vis * sim_vis + w_temp * sim_temp)
+                                if total > best_score:
+                                    best_score = float(total)
+                                    best_idx = int(idx)
+                                    best_payload = {
+                                        "sim_sem": float(sim_sem),
+                                        "sim_vis": float(sim_vis),
+                                        "sim_temp": float(sim_temp),
+                                        "total": float(total),
+                                    }
+
+                            if best_idx is None or best_payload is None:
+                                break
+
+                            selected_for_penalty.append(int(best_idx))
+                            selected_feats.append(self.history_feats[int(best_idx)])
+                            remaining.remove(int(best_idx))
+
+                            sim_vis_for_nov = float(best_payload["sim_vis"])
+                            score_details[int(best_idx)] = {
+                                "rel": float(best_payload["sim_sem"]),
+                                "nov": float(1.0 - max(0.0, min(1.0, 0.5 * (sim_vis_for_nov + 1.0)))),
+                                "cov": float(best_payload["sim_temp"]),
+                                "turn": 0.0,
+                                "total": float(best_payload["total"]),
+                                "anchor": False,
+                            }
+                            refined_score_breakdown.append({"idx": int(best_idx), **best_payload})
+
+                        historical_indices = sorted(selected_for_penalty[:historical_target])
+
+                    while len(historical_indices) < historical_target:
+                        for idx in candidate_pool_indices:
+                            if idx not in historical_indices:
+                                historical_indices.append(idx)
+                            if len(historical_indices) >= historical_target:
+                                break
+                    historical_indices = sorted(historical_indices[:historical_target])
             else:
-                sampled_tail = np.linspace(0, len(tail_indices) - 1, num=historical_target, dtype=int).tolist()
-                historical_indices = sorted(set(tail_indices[i] for i in sampled_tail))
-                while len(historical_indices) < historical_target:
-                    for idx in tail_indices:
-                        if idx not in historical_indices:
-                            historical_indices.append(idx)
-                        if len(historical_indices) >= historical_target:
-                            break
-                historical_indices = sorted(historical_indices[:historical_target])
+                candidate_pool_indices = tail_indices_all
+                if len(candidate_pool_indices) <= historical_target:
+                    historical_indices = candidate_pool_indices
+                else:
+                    sampled_tail = np.linspace(0, len(candidate_pool_indices) - 1, num=historical_target, dtype=int).tolist()
+                    historical_indices = sorted(set(candidate_pool_indices[i] for i in sampled_tail))
+                    while len(historical_indices) < historical_target:
+                        for idx in candidate_pool_indices:
+                            if idx not in historical_indices:
+                                historical_indices.append(idx)
+                            if len(historical_indices) >= historical_target:
+                                break
+                    historical_indices = sorted(historical_indices[:historical_target])
 
         selected_indices = sorted(initial_indices + historical_indices)
 
@@ -462,12 +637,22 @@ class CandidateAMemoryManager:
             "strategy": self.strategy_name,
             "fallback": None,
             "selected_indices": selected_indices[:target_hist_slots],
+            "score_details": score_details,
             "initial_indices": initial_indices,
             "historical_indices": historical_indices,
             "initial_target": initial_target,
             "historical_target": historical_target,
             "initial_used": len(initial_indices),
             "historical_used": len(historical_indices),
+            "deco_refine_enabled": deco_enabled,
+            "candidate_pool_size": len(candidate_pool_indices),
+            "candidate_pool_range": [
+                int(candidate_pool_indices[0]) if len(candidate_pool_indices) > 0 else -1,
+                int(candidate_pool_indices[-1]) if len(candidate_pool_indices) > 0 else -1,
+            ],
+            "evicted_indices": evicted_indices,
+            "eviction_happened": len(evicted_indices) > 0,
+            "refined_score_breakdown": refined_score_breakdown,
             "query_source": "instruction",
             "relevance_query": instruction,
             "parser_source": self.parser_source,
