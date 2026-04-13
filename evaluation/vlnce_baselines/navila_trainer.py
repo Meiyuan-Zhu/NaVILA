@@ -54,17 +54,41 @@ def sample_and_pad_images(images, num_frames=8, width=512, height=512):
 
 
 def _format_memory_debug(step_id, episode_id, debug_info, include_scores=True):
+    strategy_name = debug_info.get("strategy", "candidate_a")
     selected = debug_info.get("selected_indices", [])
     fallback = debug_info.get("fallback")
+    query_source = debug_info.get("query_source", "instruction")
+    parser_source = debug_info.get("parser_source", "unknown")
+    min_frame_gap = debug_info.get("min_frame_gap", 0)
+    min_gap_rejected_count = debug_info.get("min_gap_rejected_count", 0)
+    min_gap_rejected_examples = debug_info.get("min_gap_rejected_examples", [])
+    text_semantic_enabled = bool(debug_info.get("text_semantic_enabled", False))
+    stage_aware_routing_enabled = bool(debug_info.get("stage_aware_routing_enabled", False))
+    cov_in_score_enabled = bool(debug_info.get("cov_in_score_enabled", False))
+    turn_in_score_enabled = bool(debug_info.get("turn_in_score_enabled", False))
     state = debug_info.get("state", {})
     trace = debug_info.get("trace", "")
 
     parts = [
-        f"[CandidateA][ep={episode_id}][step={step_id}]",
+        f"[{strategy_name}][ep={episode_id}][step={step_id}]",
         f"selected_history_indices={selected}",
     ]
     if fallback is not None:
         parts.append(f"fallback={fallback}")
+    parts.append(f"query_source={query_source}")
+    parts.append(f"parser_source={parser_source}")
+    parts.append(
+        "flags={text_semantic:%s,stage_routing:%s,cov_score:%s,turn_score:%s}" % (
+            text_semantic_enabled,
+            stage_aware_routing_enabled,
+            cov_in_score_enabled,
+            turn_in_score_enabled,
+        )
+    )
+    parts.append(
+        f"min_frame_gap={int(min_frame_gap)} min_gap_rejected_count={int(min_gap_rejected_count)} "
+        f"min_gap_rejected_examples={min_gap_rejected_examples}"
+    )
 
     if state:
         parts.append(
@@ -82,10 +106,11 @@ def _format_memory_debug(step_id, episode_id, debug_info, include_scores=True):
             if payload is None:
                 continue
             detail_chunks.append(
-                "idx={idx}:rel={rel:.3f},nov={nov:.3f},turn={turn:.3f},total={total:.3f},anchor={anchor}".format(
+                "idx={idx}:rel={rel:.3f},nov={nov:.3f},cov={cov:.3f},turn={turn:.3f},total={total:.3f},anchor={anchor}".format(
                     idx=idx,
                     rel=float(payload.get("rel", 0.0)),
                     nov=float(payload.get("nov", 0.0)),
+                    cov=float(payload.get("cov", 0.0)),
                     turn=float(payload.get("turn", 0.0)),
                     total=float(payload.get("total", 0.0)),
                     anchor=bool(payload.get("anchor", False)),
@@ -94,6 +119,81 @@ def _format_memory_debug(step_id, episode_id, debug_info, include_scores=True):
         if detail_chunks:
             parts.append("scores={" + " | ".join(detail_chunks) + "}")
     return " ".join(parts)
+
+
+def _extract_distance_to_goal(info):
+    if not isinstance(info, dict):
+        return None
+    val = info.get("distance_to_goal")
+    try:
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _apply_stop_guard(stop_guard_cfg, raw_action, stop_streak, last_distance_to_goal, memory_manager):
+    guard_info = {
+        "enabled": bool(stop_guard_cfg.ENABLED),
+        "mode": str(stop_guard_cfg.MODE),
+        "raw_action": int(raw_action),
+        "guarded_action": int(raw_action),
+        "consecutive_stop_count": int(stop_streak),
+        "distance_to_goal": last_distance_to_goal,
+        "require_final_stage": bool(stop_guard_cfg.REQUIRE_FINAL_STAGE),
+        "at_final_stage": None,
+        "blocked": False,
+        "block_reasons": [],
+    }
+
+    if not bool(stop_guard_cfg.ENABLED) or int(raw_action) != 0:
+        return int(raw_action), guard_info
+
+    mode = str(stop_guard_cfg.MODE).lower()
+    checks = []
+
+    if mode in ("consecutive", "fusion"):
+        min_count = max(1, int(stop_guard_cfg.CONSECUTIVE_THRESHOLD))
+        cond = stop_streak >= min_count
+        guard_info["min_consecutive_required"] = min_count
+        if mode == "consecutive" or bool(stop_guard_cfg.FUSION_REQUIRE_CONSECUTIVE):
+            checks.append(("consecutive", cond))
+
+    if mode in ("distance", "fusion"):
+        dist_ok = True
+        dist_val = last_distance_to_goal
+        if dist_val is None:
+            checks.append(("distance_missing", True))
+        else:
+            threshold = float(stop_guard_cfg.DISTANCE_THRESHOLD_M)
+            dist_ok = float(dist_val) <= threshold
+            guard_info["distance_threshold_m"] = threshold
+            guard_info["distance_ok"] = bool(dist_ok)
+            if mode == "distance" or bool(stop_guard_cfg.FUSION_REQUIRE_DISTANCE):
+                checks.append(("distance", dist_ok))
+
+    if mode in ("trace", "fusion"):
+        at_final_stage = True
+        if memory_manager is not None:
+            at_final_stage = bool(memory_manager.state_tracker.is_final_stage())
+        guard_info["at_final_stage"] = at_final_stage
+        if mode == "trace" or bool(stop_guard_cfg.FUSION_REQUIRE_FINAL_STAGE):
+            if bool(stop_guard_cfg.REQUIRE_FINAL_STAGE):
+                checks.append(("final_stage", at_final_stage))
+
+    should_allow_stop = True
+    for check_name, check_ok in checks:
+        if not check_ok:
+            should_allow_stop = False
+            guard_info["block_reasons"].append(check_name)
+
+    if not should_allow_stop:
+        guard_info["blocked"] = True
+        guard_info["guarded_action"] = 1
+        return 1, guard_info
+
+    return 0, guard_info
 
 
 @baseline_registry.register_trainer(name="navila")
@@ -193,7 +293,14 @@ class NaVILATrainer(BaseVLNCETrainer):
         memory_debug_once = False
         current_episode_id = None
         memory_cfg = config.MEMORY
+        stop_guard_cfg = config.INFERENCE.STOP_GUARD
+        force_stop_enabled = bool(getattr(config.INFERENCE, "FORCE_STOP_MAX_STEPS_ENABLED", False))
+        force_stop_max_steps = max(1, int(getattr(config.INFERENCE, "FORCE_STOP_MAX_STEPS", 30)))
+        episode_step_count = 0
+        last_episode_id = None
         use_candidate_a = bool(memory_cfg.ENABLE and memory_cfg.STRATEGY == "candidate_a")
+        stop_streak = 0
+        last_distance_to_goal = None
 
         if use_candidate_a:
             memory_manager = CandidateAMemoryManager(memory_cfg)
@@ -206,7 +313,24 @@ class NaVILATrainer(BaseVLNCETrainer):
             current_episodes = envs.current_episodes()
             episode_id = current_episodes[0].episode_id
 
-            if len(queue_actions) > 0:
+            if episode_id != last_episode_id:
+                episode_step_count = 0
+                last_episode_id = episode_id
+
+            force_stop_now = bool(force_stop_enabled and episode_step_count >= force_stop_max_steps)
+
+            if force_stop_now:
+                if len(queue_actions) > 0:
+                    queue_actions = []
+                logger.info(
+                    f"[ForcedStop][ep={episode_id}] step_count={episode_step_count} reached max={force_stop_max_steps}; sending STOP."
+                )
+                outputs = envs.step([0])
+                stop_streak += 1
+                if memory_manager is not None:
+                    memory_manager.update_after_action(action_id=0, turn_deg=0.0)
+
+            elif len(queue_actions) > 0:
                 print(f"using queue...{queue_actions[0]}")
                 queued_action = queue_actions[0]
                 outputs = envs.step([queued_action])
@@ -271,6 +395,10 @@ class NaVILATrainer(BaseVLNCETrainer):
                         f"Analyze this series of images to decide your next action, which could be turning left or right by a specific "
                         f"degree, moving forward a certain distance, or stop if the task is completed."
                     )
+                    if memory_manager is not None and bool(getattr(memory_cfg, "ENABLE_TRACE_IN_PROMPT", False)):
+                        trace_text = memory_manager.state_tracker.get_trace_text()
+                        if trace_text:
+                            question += f" Current navigation trace: {trace_text}."
 
                     conv_mode = "llama_3"
                     conv = conv_templates[conv_mode].copy()
@@ -331,8 +459,41 @@ class NaVILATrainer(BaseVLNCETrainer):
                         actions = [map_string_to_action(outputs)]
                     except:
                         actions = [1]
+
+                    raw_action = 1 if actions[0] is None else int(actions[0])
+                    if raw_action == 0:
+                        stop_streak += 1
+                    else:
+                        stop_streak = 0
+
+                    guarded_action, guard_info = _apply_stop_guard(
+                        stop_guard_cfg=stop_guard_cfg,
+                        raw_action=raw_action,
+                        stop_streak=stop_streak,
+                        last_distance_to_goal=last_distance_to_goal,
+                        memory_manager=memory_manager,
+                    )
+                    actions = [guarded_action]
                     print(actions)
                     logger.info(f"[ActionID][ep={episode_id}] {actions}")
+                    if bool(stop_guard_cfg.ENABLED):
+                        logger.info(
+                            "[StopGuard][ep={ep}] raw={raw} guarded={guarded} blocked={blocked} reasons={reasons} "
+                            "distance={dist} stage={stage} consecutive_stop_count={count}".format(
+                                ep=episode_id,
+                                raw=guard_info.get("raw_action"),
+                                guarded=guard_info.get("guarded_action"),
+                                blocked=guard_info.get("blocked"),
+                                reasons=guard_info.get("block_reasons", []),
+                                dist=guard_info.get("distance_to_goal"),
+                                stage=(
+                                    memory_manager.state_tracker.current_subgoal_id
+                                    if memory_manager is not None
+                                    else -1
+                                ),
+                                count=guard_info.get("consecutive_stop_count"),
+                            )
+                        )
 
                 if actions[0] == 1:
                     try:
@@ -386,6 +547,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                         memory_manager.update_after_action(action_id=0, turn_deg=0.0)
 
             observations, _, dones, infos = [list(x) for x in zip(*outputs)]
+            episode_step_count += 1
+            last_distance_to_goal = _extract_distance_to_goal(infos[0]) if len(infos) > 0 else None
 
             # reset envs and observations if necessary
             for i in range(envs.num_envs):
@@ -403,6 +566,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                 stats_episodes[ep_id] = infos[i]
                 observations[i] = envs.reset_at(i)[0]
                 past_rgbs[i] = []
+                episode_step_count = 0
+                last_episode_id = None
                 if memory_manager is not None and i == 0:
                     current_episode_id = None
 

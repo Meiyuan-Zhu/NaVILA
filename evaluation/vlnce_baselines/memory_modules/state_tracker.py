@@ -59,3 +59,15 @@ class StateTracker:
             f"recent_actions={payload['recent_actions']};"
             f"last_cue={payload['last_milestone_text'] or 'none'}"
         )
+
+    def get_current_subgoal_text(self) -> Optional[str]:
+        if not self.subgoals:
+            return None
+        if self.current_subgoal_id < 0 or self.current_subgoal_id >= len(self.subgoals):
+            return None
+        return self.subgoals[self.current_subgoal_id]
+
+    def is_final_stage(self) -> bool:
+        if not self.subgoals:
+            return True
+        return self.current_subgoal_id >= len(self.subgoals) - 1

@@ -15,9 +15,18 @@ class CandidateAMemoryManager:
 
     def __init__(self, memory_cfg):
         self.cfg = memory_cfg
+        parser_cfg = getattr(memory_cfg, "SUBGOAL_PARSER", None)
         self.parser = SubgoalParser(
             cache_dir=str(memory_cfg.SUBGOAL_CACHE_DIR),
             enabled=bool(memory_cfg.USE_SUBGOAL_PARSER),
+            use_llm=bool(getattr(parser_cfg, "USE_LLM", False)),
+            backend=str(getattr(parser_cfg, "BACKEND", "openai_compatible")),
+            model=str(getattr(parser_cfg, "MODEL", "qwen-flash")),
+            api_base_url=str(getattr(parser_cfg, "API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")),
+            api_key_env=str(getattr(parser_cfg, "API_KEY_ENV", "DASHSCOPE_API_KEY")),
+            timeout_seconds=int(getattr(parser_cfg, "TIMEOUT_SECONDS", 8)),
+            max_subgoals=int(getattr(parser_cfg, "MAX_SUBGOALS", 8)),
+            fallback_to_rule=bool(getattr(parser_cfg, "FALLBACK_TO_RULE", True)),
         )
         self.state_tracker = StateTracker(
             max_actions=int(memory_cfg.STATE.MAX_RECENT_ACTIONS),
@@ -28,7 +37,17 @@ class CandidateAMemoryManager:
             weight_rel=float(memory_cfg.WEIGHTS.RELEVANCE),
             weight_nov=float(memory_cfg.WEIGHTS.NOVELTY),
             weight_turn=float(memory_cfg.WEIGHTS.TURN_BONUS),
+            weight_cov=float(getattr(memory_cfg.WEIGHTS, "COVERAGE", 0.0)),
             turn_threshold_deg=float(memory_cfg.TURN_THRESHOLD_DEGREES),
+            enable_cov_in_score=bool(getattr(memory_cfg, "ENABLE_COV_IN_SCORE", False)),
+            enable_turn_in_score=bool(getattr(memory_cfg, "ENABLE_TURN_IN_SCORE", False)),
+            use_text_semantic_relevance=bool(getattr(memory_cfg, "USE_TEXT_SEMANTIC_RELEVANCE", True)),
+            text_embed_dim=int(getattr(memory_cfg, "TEXT_EMBED_DIM", 128)),
+        )
+        self.min_frame_gap = max(0, int(getattr(memory_cfg, "MIN_FRAME_GAP", 0)))
+        self.enable_stage_aware_routing = bool(getattr(memory_cfg, "ENABLE_STAGE_AWARE_ROUTING", False))
+        self.strategy_name = (
+            "candidate_a_lite_v2" if bool(getattr(memory_cfg, "ENABLE_CANDIDATE_A_LITE_V2", False)) else "candidate_a"
         )
 
         self.episode_id: Optional[str] = None
@@ -37,9 +56,11 @@ class CandidateAMemoryManager:
         self.history_feats: List[np.ndarray] = []
         self._cached_hist_len = 0
         self._fallback_warned = False
+        self.parser_source = "rule"
 
     def reset_episode(self, episode_id: str, instruction: str):
         subgoals = self.parser.parse(instruction)
+        self.parser_source = str(getattr(self.parser, "last_source", "rule"))
         self.state_tracker.reset(subgoals)
         self.episode_id = episode_id
         self.step_id = 0
@@ -82,12 +103,12 @@ class CandidateAMemoryManager:
         self.step_id += 1
 
         if num_frames is None or num_frames <= 1:
-            return [current_frame], {"strategy": "candidate_a", "selected_indices": []}
+            return [current_frame], {"strategy": self.strategy_name, "selected_indices": []}
 
         if len(history_frames) == 0:
             frames = self._uniform_sample([current_frame], num_frames=num_frames, width=width, height=height)
             return frames, {
-                "strategy": "candidate_a",
+                "strategy": self.strategy_name,
                 "fallback": "empty_history",
                 "selected_indices": [],
                 "state": self.state_tracker.as_dict(),
@@ -102,6 +123,16 @@ class CandidateAMemoryManager:
             truncated = True
 
         target_hist_slots = num_frames - 1
+        current_subgoal_text = self.state_tracker.get_current_subgoal_text()
+        use_subgoal_for_rel = bool(
+            self.enable_stage_aware_routing and getattr(self.cfg, "USE_SUBGOAL_FOR_RELEVANCE", False)
+        )
+        use_subgoal_query = bool(use_subgoal_for_rel and current_subgoal_text)
+        relevance_query = current_subgoal_text if use_subgoal_query else instruction
+        query_source = "subgoal" if use_subgoal_query else "instruction"
+        query_text_feat = None
+        if self.scorer.use_text_semantic_relevance:
+            query_text_feat = self.scorer.compute_text_feature(relevance_query)
 
         current_feat = self.scorer.compute_feature(current_frame)
 
@@ -121,6 +152,7 @@ class CandidateAMemoryManager:
             0: {
                 "rel": 1.0,
                 "nov": 0.0,
+                "cov": 0.0,
                 "turn": 0.0,
                 "total": 1.0,
                 "anchor": True,
@@ -129,6 +161,7 @@ class CandidateAMemoryManager:
 
         index_pool = list(range(1, len(history)))
         meta_list = list(self.frame_meta)[-len(history) :]
+        min_gap_rejected_indices: List[int] = []
 
         while len(selected_indices) < min(target_hist_slots, len(history)) and len(index_pool) > 0:
             best_idx = None
@@ -136,6 +169,11 @@ class CandidateAMemoryManager:
             best_payload = None
 
             for idx in index_pool:
+                selected_non_anchor = [s for s in selected_indices if s > 0]
+                if self.min_frame_gap > 0 and any(abs(int(idx) - int(s)) < self.min_frame_gap for s in selected_non_anchor):
+                    min_gap_rejected_indices.append(int(idx))
+                    continue
+
                 frame_meta = meta_list[idx] if idx < len(meta_list) else None
                 rel = self.scorer.relevance(
                     hist_feats[idx],
@@ -143,16 +181,23 @@ class CandidateAMemoryManager:
                     idx=idx,
                     num_candidates=len(history),
                     instruction=instruction,
+                    current_subgoal_text=relevance_query,
+                    query_text_feat=query_text_feat,
                     frame_meta=frame_meta,
                 )
                 nov = self.scorer.novelty(hist_feats[idx], selected_feats)
+                cov = self.scorer.temporal_coverage(
+                    idx=idx,
+                    selected_indices=selected_indices,
+                    num_candidates=len(history),
+                )
                 turn = self.scorer.turn_bonus(frame_meta)
-                total = self.scorer.total_score(rel=rel, nov=nov, turn=turn)
+                total = self.scorer.total_score(rel=rel, nov=nov, cov=cov, turn=turn)
 
                 if total > best_score:
                     best_score = total
                     best_idx = idx
-                    best_payload = {"rel": rel, "nov": nov, "turn": turn, "total": total, "anchor": False}
+                    best_payload = {"rel": rel, "nov": nov, "cov": cov, "turn": turn, "total": total, "anchor": False}
 
             if best_idx is None:
                 break
@@ -162,15 +207,41 @@ class CandidateAMemoryManager:
             score_details[best_idx] = best_payload
             index_pool.remove(best_idx)
 
+        fallback_reason = None
         if len(selected_indices) < target_hist_slots:
-            for idx in reversed(range(len(history))):
+            fallback_reason = "min_gap_relaxed" if self.min_frame_gap > 0 else "insufficient_candidates"
+            relaxed_pool = [idx for idx in index_pool if idx not in selected_indices]
+            relaxed_ranked: List[Tuple[float, int, Dict[str, float]]] = []
+            for idx in relaxed_pool:
+                frame_meta = meta_list[idx] if idx < len(meta_list) else None
+                rel = self.scorer.relevance(
+                    hist_feats[idx],
+                    current_feat,
+                    idx=idx,
+                    num_candidates=len(history),
+                    instruction=instruction,
+                    current_subgoal_text=relevance_query,
+                    query_text_feat=query_text_feat,
+                    frame_meta=frame_meta,
+                )
+                nov = self.scorer.novelty(hist_feats[idx], selected_feats)
+                cov = self.scorer.temporal_coverage(
+                    idx=idx,
+                    selected_indices=selected_indices,
+                    num_candidates=len(history),
+                )
+                turn = self.scorer.turn_bonus(frame_meta)
+                total = self.scorer.total_score(rel=rel, nov=nov, cov=cov, turn=turn)
+                payload = {"rel": rel, "nov": nov, "cov": cov, "turn": turn, "total": total, "anchor": False}
+                relaxed_ranked.append((total, idx, payload))
+
+            relaxed_ranked.sort(key=lambda x: x[0], reverse=True)
+            for _, idx, payload in relaxed_ranked:
                 if idx in selected_indices:
                     continue
                 selected_indices.append(idx)
-                score_details[idx] = score_details.get(
-                    idx,
-                    {"rel": 0.0, "nov": 0.0, "turn": 0.0, "total": 0.0, "anchor": False},
-                )
+                score_details[idx] = payload
+                selected_feats.append(hist_feats[idx])
                 if len(selected_indices) >= target_hist_slots:
                     break
 
@@ -182,10 +253,20 @@ class CandidateAMemoryManager:
 
         final_frames = selected_history + [current_frame]
         debug_info = {
-            "strategy": "candidate_a",
-            "fallback": None,
+            "strategy": self.strategy_name,
+            "fallback": fallback_reason,
             "selected_indices": selected_indices,
             "score_details": score_details,
+            "query_source": query_source,
+            "relevance_query": relevance_query,
+            "parser_source": self.parser_source,
+            "min_frame_gap": self.min_frame_gap,
+            "min_gap_rejected_count": len(min_gap_rejected_indices),
+            "min_gap_rejected_examples": sorted(set(min_gap_rejected_indices))[:8],
+            "text_semantic_enabled": bool(self.scorer.use_text_semantic_relevance),
+            "stage_aware_routing_enabled": bool(self.enable_stage_aware_routing),
+            "cov_in_score_enabled": bool(self.scorer.enable_cov_in_score),
+            "turn_in_score_enabled": bool(self.scorer.enable_turn_in_score),
             "state": self.state_tracker.as_dict(),
             "trace": self.state_tracker.get_trace_text(),
         }
