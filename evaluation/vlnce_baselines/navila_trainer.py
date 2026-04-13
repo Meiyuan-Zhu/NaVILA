@@ -163,6 +163,51 @@ def _format_stage_tracker_debug(episode_id, step_id, payload, recent_actions):
     )
 
 
+def _is_loop_signal(evidence, recent_actions, recovery_cfg):
+    evidence_text = str(evidence or "").lower()
+    keywords = [str(x).lower() for x in list(getattr(recovery_cfg, "EVIDENCE_KEYWORDS", []))]
+    evidence_hit = any(k in evidence_text for k in keywords)
+
+    actions = [int(a) for a in list(recent_actions or [])]
+    if len(actions) == 0:
+        return evidence_hit
+    counts = {}
+    for a in actions:
+        counts[a] = counts.get(a, 0) + 1
+    dominance = float(max(counts.values())) / float(len(actions))
+    dominance_hit = dominance >= float(getattr(recovery_cfg, "ACTION_DOMINANCE_THRESHOLD", 0.75))
+    return bool(evidence_hit or dominance_hit)
+
+
+def _apply_loop_recovery_action(raw_action, last_action, consecutive_turns, recovery_cfg):
+    adjusted = int(raw_action)
+    reason = None
+
+    if (
+        last_action is not None
+        and adjusted == int(last_action)
+        and int(getattr(recovery_cfg, "MAX_REPEAT_SAME_ACTION", 1)) <= 1
+    ):
+        if adjusted == 2:
+            adjusted = 3
+            reason = "flip_turn_left_to_right"
+        elif adjusted == 3:
+            adjusted = 2
+            reason = "flip_turn_right_to_left"
+        elif adjusted == 1:
+            adjusted = 2
+            reason = "break_forward_repeat_with_turn"
+
+    if (
+        adjusted in (2, 3)
+        and int(consecutive_turns) >= int(getattr(recovery_cfg, "FORCE_FORWARD_AFTER_CONSECUTIVE_TURNS", 6))
+    ):
+        adjusted = 1
+        reason = "force_forward_after_many_turns"
+
+    return int(adjusted), reason
+
+
 def _apply_stop_guard(stop_guard_cfg, raw_action, stop_streak, last_distance_to_goal, memory_manager):
     guard_info = {
         "enabled": bool(stop_guard_cfg.ENABLED),
@@ -257,7 +302,12 @@ class NaVILATrainer(BaseVLNCETrainer):
         # build model
         model_name = os.path.basename(os.path.normpath(checkpoint_path))
         tokenizer, model, image_processor, context_len = load_pretrained_model(checkpoint_path, model_name)
-        model = model.cuda()
+        try:
+            model = model.cuda()
+        except NotImplementedError:
+            # Some loaders dispatch weights with accelerate/device_map and keep meta placeholders.
+            # In that case forcing .cuda() fails; keep the dispatched placement.
+            logger.info("Skip model.cuda(); using pre-dispatched model placement.")
 
         config = self.config.clone()
         split = config.EVAL.SPLIT
@@ -323,6 +373,7 @@ class NaVILATrainer(BaseVLNCETrainer):
         memory_debug_once = False
         current_episode_id = None
         memory_cfg = config.MEMORY
+        recovery_cfg = memory_cfg.LOOP_RECOVERY
         stop_guard_cfg = config.INFERENCE.STOP_GUARD
         force_stop_enabled = bool(getattr(config.INFERENCE, "FORCE_STOP_MAX_STEPS_ENABLED", False))
         force_stop_max_steps = max(1, int(getattr(config.INFERENCE, "FORCE_STOP_MAX_STEPS", 30)))
@@ -335,6 +386,10 @@ class NaVILATrainer(BaseVLNCETrainer):
         stage_tracker = None
         stop_streak = 0
         last_distance_to_goal = None
+        loop_signal_streak = 0
+        recovery_hint_budget = 0
+        last_decided_action = None
+        consecutive_turns = 0
 
         if use_selective_memory:
             memory_manager = CandidateAMemoryManager(memory_cfg)
@@ -405,8 +460,9 @@ class NaVILATrainer(BaseVLNCETrainer):
                                 )
                             else:
                                 subgoal_text = "none"
+                            parser_reason = str(getattr(memory_manager.parser, "last_reason", "unknown"))
                             logger.info(
-                                f"[EpisodeSubgoals][ep={episode_id}] source={memory_manager.parser_source} subgoals={subgoal_text}"
+                                f"[EpisodeSubgoals][ep={episode_id}] source={memory_manager.parser_source} reason={parser_reason} subgoals={subgoal_text}"
                             )
                             current_episode_id = episode_id
                         try:
@@ -484,6 +540,29 @@ class NaVILATrainer(BaseVLNCETrainer):
                                     )
                                 )
 
+                                if bool(getattr(recovery_cfg, "ENABLE", True)):
+                                    loop_hit = _is_loop_signal(
+                                        evidence=stage_payload.get("evidence", ""),
+                                        recent_actions=list(memory_manager.state_tracker.recent_actions),
+                                        recovery_cfg=recovery_cfg,
+                                    )
+                                    if loop_hit:
+                                        loop_signal_streak += 1
+                                    else:
+                                        loop_signal_streak = 0
+
+                                    if loop_signal_streak >= int(getattr(recovery_cfg, "MIN_CONSECUTIVE_LOOP_SIGNALS", 2)):
+                                        recovery_hint_budget = int(getattr(recovery_cfg, "HINT_STEPS", 3))
+                                        logger.info(
+                                            "[LoopRecovery][ep={ep}][step={step}] triggered=True streak={streak} budget={budget} evidence={ev}".format(
+                                                ep=episode_id,
+                                                step=memory_manager.step_id,
+                                                streak=loop_signal_streak,
+                                                budget=recovery_hint_budget,
+                                                ev=str(stage_payload.get("evidence", "")),
+                                            )
+                                        )
+
                             should_log = bool(memory_cfg.LOG_SELECTED_FRAMES) and (
                                 memory_manager.step_id == 1
                                 or (memory_manager.step_id % max(1, int(memory_cfg.LOG_INTERVAL)) == 0)
@@ -546,6 +625,19 @@ class NaVILATrainer(BaseVLNCETrainer):
                         if trace_text:
                             question += f" Current navigation trace: {trace_text}."
 
+                    if bool(getattr(recovery_cfg, "ENABLE", True)) and recovery_hint_budget > 0:
+                        question += (
+                            " Recovery hint: you may be stuck in an action loop. "
+                            "Avoid repeating the same action continuously. "
+                            "Prefer a recovery move: rotate to a new heading, then move forward to re-observe."
+                        )
+                        logger.info(
+                            "[LoopRecoveryHint][ep={ep}] active=True budget_left={budget}".format(
+                                ep=episode_id,
+                                budget=recovery_hint_budget,
+                            )
+                        )
+
                     conv_mode = "llama_3"
                     conv = conv_templates[conv_mode].copy()
                     conv.append_message(conv.roles[0], question)
@@ -607,10 +699,36 @@ class NaVILATrainer(BaseVLNCETrainer):
                         actions = [1]
 
                     raw_action = 1 if actions[0] is None else int(actions[0])
+
+                    if bool(getattr(recovery_cfg, "ENABLE", True)) and recovery_hint_budget > 0:
+                        adjusted_action, recovery_reason = _apply_loop_recovery_action(
+                            raw_action=raw_action,
+                            last_action=last_decided_action,
+                            consecutive_turns=consecutive_turns,
+                            recovery_cfg=recovery_cfg,
+                        )
+                        if adjusted_action != raw_action:
+                            logger.info(
+                                "[LoopRecoveryAction][ep={ep}] raw={raw} adjusted={adj} reason={reason}".format(
+                                    ep=episode_id,
+                                    raw=raw_action,
+                                    adj=adjusted_action,
+                                    reason=str(recovery_reason),
+                                )
+                            )
+                        raw_action = adjusted_action
+                        recovery_hint_budget = max(0, int(recovery_hint_budget) - 1)
+
                     if raw_action == 0:
                         stop_streak += 1
                     else:
                         stop_streak = 0
+
+                    if raw_action in (2, 3):
+                        consecutive_turns += 1
+                    else:
+                        consecutive_turns = 0
+                    last_decided_action = int(raw_action)
 
                     guarded_action, guard_info = _apply_stop_guard(
                         stop_guard_cfg=stop_guard_cfg,

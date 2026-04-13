@@ -27,6 +27,7 @@ class CandidateAMemoryManager:
             timeout_seconds=int(getattr(parser_cfg, "TIMEOUT_SECONDS", 8)),
             max_subgoals=int(getattr(parser_cfg, "MAX_SUBGOALS", 8)),
             fallback_to_rule=bool(getattr(parser_cfg, "FALLBACK_TO_RULE", True)),
+            require_llm_success=bool(getattr(parser_cfg, "REQUIRE_LLM_SUCCESS", False)),
         )
         self.state_tracker = StateTracker(
             max_actions=int(memory_cfg.STATE.MAX_RECENT_ACTIONS),

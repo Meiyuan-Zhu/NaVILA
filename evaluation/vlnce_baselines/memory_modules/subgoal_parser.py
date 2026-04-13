@@ -22,6 +22,7 @@ class SubgoalParser:
         timeout_seconds: int = 8,
         max_subgoals: int = 8,
         fallback_to_rule: bool = True,
+        require_llm_success: bool = False,
     ):
         self.cache_dir = cache_dir
         self.enabled = enabled
@@ -33,7 +34,9 @@ class SubgoalParser:
         self.timeout_seconds = timeout_seconds
         self.max_subgoals = max_subgoals
         self.fallback_to_rule = fallback_to_rule
+        self.require_llm_success = require_llm_success
         self.last_source = "rule"
+        self.last_reason = "init"
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def parse_one_shot(self, instruction: str) -> List[str]:
@@ -46,7 +49,13 @@ class SubgoalParser:
             return []
         if not self.enabled:
             self.last_source = "disabled"
+            self.last_reason = "parser_disabled"
             return [instruction.strip()]
+
+        if self.require_llm_success and not self.use_llm:
+            self.last_source = "error"
+            self.last_reason = "require_llm_but_use_llm_false"
+            raise RuntimeError("SubgoalParser REQUIRE_LLM_SUCCESS=True but USE_LLM=False")
 
         normalized_instruction = instruction.strip()
         cache_key = hashlib.sha1(normalized_instruction.encode("utf-8")).hexdigest()
@@ -58,10 +67,14 @@ class SubgoalParser:
                     payload = json.load(f)
                 cached_subgoals, cached_source = self._parse_cached_payload(payload)
                 if len(cached_subgoals) > 0:
-                    self.last_source = cached_source
-                    return cached_subgoals[: max(1, int(self.max_subgoals))]
+                    if self.require_llm_success and cached_source != "llm":
+                        self.last_reason = f"cache_bypassed_non_llm:{cached_source}"
+                    else:
+                        self.last_reason = f"cache_hit:{cached_source}"
+                        self.last_source = cached_source
+                        return cached_subgoals[: max(1, int(self.max_subgoals))]
             except Exception:
-                pass
+                self.last_reason = "cache_read_error"
 
         source = "rule"
         subgoals: List[str] = []
@@ -69,16 +82,26 @@ class SubgoalParser:
             subgoals = self._try_openai_compatible_split(normalized_instruction)
             source = "llm" if len(subgoals) > 0 else "rule"
 
+        if self.require_llm_success and len(subgoals) == 0:
+            self.last_source = "error"
+            if not self.last_reason.startswith("llm_"):
+                self.last_reason = "llm_empty_response"
+            raise RuntimeError(f"SubgoalParser LLM required but failed: {self.last_reason}")
+
         if len(subgoals) == 0 and self.fallback_to_rule:
             subgoals = self._rule_based_split(normalized_instruction)
             source = "rule"
+            self.last_reason = "rule_fallback"
 
         if len(subgoals) == 0:
             subgoals = [normalized_instruction]
             source = "instruction"
+            self.last_reason = "instruction_passthrough"
 
         subgoals = self._clean_subgoals(subgoals)
         self.last_source = source
+        if source == "llm":
+            self.last_reason = "llm_success"
 
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
@@ -116,6 +139,7 @@ class SubgoalParser:
     def _try_openai_compatible_split(self, instruction: str) -> List[str]:
         api_key = os.environ.get(self.api_key_env, "")
         if api_key == "":
+            self.last_reason = f"llm_api_key_missing:{self.api_key_env}"
             return []
 
         prompt = (
@@ -149,16 +173,25 @@ class SubgoalParser:
         try:
             with urllib.request.urlopen(req, timeout=max(1, int(self.timeout_seconds))) as resp:
                 body = resp.read().decode("utf-8")
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        except urllib.error.HTTPError as exc:
+            self.last_reason = f"llm_http_error:{getattr(exc, 'code', 'unknown')}"
+            return []
+        except (urllib.error.URLError, TimeoutError):
+            self.last_reason = "llm_network_or_timeout"
             return []
         except Exception:
+            self.last_reason = "llm_unknown_transport_error"
             return []
 
         try:
             response_json = json.loads(body)
             message = response_json["choices"][0]["message"]["content"]
-            return self._parse_llm_output(message)
+            parsed = self._parse_llm_output(message)
+            if len(parsed) == 0:
+                self.last_reason = "llm_empty_content"
+            return parsed
         except Exception:
+            self.last_reason = "llm_response_parse_error"
             return []
 
     def _parse_llm_output(self, content: str) -> List[str]:

@@ -1,0 +1,12 @@
+{
+  "subgoals": [
+    "walk out of the bedroom through the open door into the hallway",
+    "turn the corner",
+    "walk into the dining area",
+    "pass the dining table",
+    "walk into the living room area towards the television",
+    "stop near the chair",
+    "open sliding doors to outside"
+  ],
+  "source": "rule"
+}
