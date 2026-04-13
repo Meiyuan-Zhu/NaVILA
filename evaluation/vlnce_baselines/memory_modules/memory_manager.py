@@ -62,7 +62,7 @@ class CandidateAMemoryManager:
         self.parser_source = "rule"
 
     def reset_episode(self, episode_id: str, instruction: str):
-        subgoals = self.parser.parse(instruction)
+        subgoals = self.parser.parse_one_shot(instruction)
         self.parser_source = str(getattr(self.parser, "last_source", "rule"))
         self.state_tracker.reset(subgoals)
         self.episode_id = episode_id

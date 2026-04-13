@@ -36,7 +36,12 @@ class SubgoalParser:
         self.last_source = "rule"
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def parse(self, instruction: str) -> List[str]:
+    def parse_one_shot(self, instruction: str) -> List[str]:
+        """One-shot parser.
+
+        Input: full instruction text.
+        Output: ordered subgoal list.
+        """
         if not instruction:
             return []
         if not self.enabled:
@@ -54,7 +59,7 @@ class SubgoalParser:
                 cached_subgoals, cached_source = self._parse_cached_payload(payload)
                 if len(cached_subgoals) > 0:
                     self.last_source = cached_source
-                    return cached_subgoals
+                    return cached_subgoals[: max(1, int(self.max_subgoals))]
             except Exception:
                 pass
 
@@ -72,6 +77,7 @@ class SubgoalParser:
             subgoals = [normalized_instruction]
             source = "instruction"
 
+        subgoals = self._clean_subgoals(subgoals)
         self.last_source = source
 
         try:
@@ -89,6 +95,10 @@ class SubgoalParser:
             pass
 
         return subgoals
+
+    def parse(self, instruction: str) -> List[str]:
+        # Backward compatible entrypoint.
+        return self.parse_one_shot(instruction)
 
     @staticmethod
     def _parse_cached_payload(payload):
@@ -109,9 +119,11 @@ class SubgoalParser:
             return []
 
         prompt = (
-            "Split the navigation instruction into an ordered list of short subgoals. "
-            "Return strict JSON with shape {\"subgoals\": [\"...\"]}. "
-            "Do not include explanations."
+            "You are a one-shot navigation subgoal parser. "
+            "Input is one full instruction sentence. "
+            "Output must be an ordered list of atomic subgoals. "
+            "Return strict JSON only with schema {\"subgoals\": [\"...\"]}. "
+            "Do not output explanations."
         )
         user_content = f"Instruction: {instruction}"
 
@@ -145,30 +157,51 @@ class SubgoalParser:
         try:
             response_json = json.loads(body)
             message = response_json["choices"][0]["message"]["content"]
-            parsed = json.loads(message)
-            raw_subgoals = parsed.get("subgoals", [])
-            if not isinstance(raw_subgoals, list):
-                return []
-
-            cleaned = []
-            for entry in raw_subgoals:
-                text = str(entry).strip().strip(".")
-                if text:
-                    cleaned.append(text)
-
-            if len(cleaned) == 0:
-                return []
-
-            return cleaned[: max(1, int(self.max_subgoals))]
+            return self._parse_llm_output(message)
         except Exception:
             return []
+
+    def _parse_llm_output(self, content: str) -> List[str]:
+        # Prefer strict JSON, but tolerate numbered lines as backup.
+        try:
+            parsed = json.loads(content)
+            raw_subgoals = parsed.get("subgoals", []) if isinstance(parsed, dict) else []
+            if isinstance(raw_subgoals, list):
+                return self._clean_subgoals(raw_subgoals)
+        except Exception:
+            pass
+
+        numbered = []
+        for line in (content or "").splitlines():
+            m = re.match(r"^\s*\d+[\.)]\s*(.+?)\s*$", line)
+            if m:
+                numbered.append(m.group(1))
+        return self._clean_subgoals(numbered)
+
+    def _clean_subgoals(self, raw_subgoals: List[str]) -> List[str]:
+        cleaned = []
+        for entry in raw_subgoals:
+            text = str(entry).strip().strip(".")
+            text = re.sub(r"^\s*(and|then)\s+", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s+", " ", text)
+            if text:
+                cleaned.append(text)
+        if len(cleaned) == 0:
+            return []
+        return cleaned[: max(1, int(self.max_subgoals))]
 
     @staticmethod
     def _rule_based_split(instruction: str) -> List[str]:
         text = instruction.strip().lower()
         text = re.sub(r"\s+", " ", text)
-        text = text.replace(" then ", ", ")
         text = text.replace(" and then ", ", ")
-        parts = re.split(r",|;|\band\b", text)
-        parts = [p.strip(" .") for p in parts if p and p.strip(" .")]
-        return parts if parts else [text]
+        text = text.replace(" then ", ", ")
+        text = re.sub(r"\bafter that\b", ",", text)
+        parts = re.split(r",|;|\.(?=\s)|\band\b", text)
+        cleaned = []
+        for p in parts:
+            seg = p.strip(" .")
+            seg = re.sub(r"^\s*(and|then)\s+", "", seg, flags=re.IGNORECASE)
+            if seg:
+                cleaned.append(seg)
+        return cleaned if cleaned else [text]

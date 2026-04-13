@@ -1,8 +1,0 @@
-{
-  "subgoals": [
-    "walk out of bedroom",
-    "turn left to hallway",
-    "stop near table"
-  ],
-  "source": "rule"
-}

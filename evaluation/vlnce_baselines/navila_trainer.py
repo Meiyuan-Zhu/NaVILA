@@ -352,6 +352,16 @@ class NaVILATrainer(BaseVLNCETrainer):
                     if memory_manager is not None:
                         if current_episode_id != episode_id:
                             memory_manager.reset_episode(episode_id=episode_id, instruction=instruction)
+                            subgoals = list(getattr(memory_manager.state_tracker, "subgoals", []) or [])
+                            if len(subgoals) > 0:
+                                subgoal_text = " | ".join(
+                                    [f"{idx + 1}.{sg}" for idx, sg in enumerate(subgoals)]
+                                )
+                            else:
+                                subgoal_text = "none"
+                            logger.info(
+                                f"[EpisodeSubgoals][ep={episode_id}] source={memory_manager.parser_source} subgoals={subgoal_text}"
+                            )
                             current_episode_id = episode_id
                         try:
                             past_and_current_rgbs, memory_debug = memory_manager.select_frames(
