@@ -46,9 +46,12 @@ class CandidateAMemoryManager:
         )
         self.min_frame_gap = max(0, int(getattr(memory_cfg, "MIN_FRAME_GAP", 0)))
         self.enable_stage_aware_routing = bool(getattr(memory_cfg, "ENABLE_STAGE_AWARE_ROUTING", False))
-        self.strategy_name = (
-            "candidate_a_lite_v2" if bool(getattr(memory_cfg, "ENABLE_CANDIDATE_A_LITE_V2", False)) else "candidate_a"
-        )
+        if str(getattr(memory_cfg, "STRATEGY", "candidate_a")) == "candidate_b_v1":
+            self.strategy_name = "candidate_b_v1"
+        else:
+            self.strategy_name = (
+                "candidate_a_lite_v2" if bool(getattr(memory_cfg, "ENABLE_CANDIDATE_A_LITE_V2", False)) else "candidate_a"
+            )
 
         self.episode_id: Optional[str] = None
         self.step_id = 0
@@ -114,6 +117,16 @@ class CandidateAMemoryManager:
                 "state": self.state_tracker.as_dict(),
                 "trace": self.state_tracker.get_trace_text(),
             }
+
+        if self.strategy_name == "candidate_b_v1":
+            return self._select_frames_candidate_b_v1(
+                history_frames=history_frames,
+                current_frame=current_frame,
+                instruction=instruction,
+                num_frames=num_frames,
+                width=width,
+                height=height,
+            )
 
         history = list(history_frames)
         max_hist_frames = int(self.cfg.BUFFER.MAX_HISTORY_FRAMES)
@@ -267,6 +280,104 @@ class CandidateAMemoryManager:
             "stage_aware_routing_enabled": bool(self.enable_stage_aware_routing),
             "cov_in_score_enabled": bool(self.scorer.enable_cov_in_score),
             "turn_in_score_enabled": bool(self.scorer.enable_turn_in_score),
+            "state": self.state_tracker.as_dict(),
+            "trace": self.state_tracker.get_trace_text(),
+        }
+        return final_frames, debug_info
+
+    def _select_frames_candidate_b_v1(
+        self,
+        history_frames: List[Image.Image],
+        current_frame: Image.Image,
+        instruction: str,
+        num_frames: int,
+        width: int = 512,
+        height: int = 512,
+    ) -> Tuple[List[Image.Image], Dict[str, object]]:
+        history = list(history_frames)
+        max_hist_frames = int(self.cfg.BUFFER.MAX_HISTORY_FRAMES)
+        if len(history) > max_hist_frames:
+            history = history[-max_hist_frames:]
+
+        if num_frames is None or num_frames <= 1:
+            return [current_frame], {"strategy": self.strategy_name, "selected_indices": []}
+
+        target_hist_slots = max(1, int(num_frames) - 1)
+        desired_uniform = 6
+        desired_relevance = 2
+        relevance_k = min(desired_relevance, max(0, target_hist_slots - 1))
+        uniform_k = max(1, target_hist_slots - relevance_k)
+
+        # Uniform pool always preserves the initial frame (idx=0).
+        if len(history) <= uniform_k:
+            uniform_indices = list(range(len(history)))
+        else:
+            uniform_indices = np.linspace(0, len(history) - 1, num=uniform_k, dtype=int).tolist()
+            if 0 not in uniform_indices:
+                uniform_indices[0] = 0
+            uniform_indices = sorted(set(int(i) for i in uniform_indices))
+            while len(uniform_indices) < uniform_k:
+                for i in range(len(history)):
+                    if i not in uniform_indices:
+                        uniform_indices.append(i)
+                    if len(uniform_indices) >= uniform_k:
+                        break
+            uniform_indices = sorted(uniform_indices[:uniform_k])
+
+        meta_list = list(self.frame_meta)[-len(history) :]
+        query_text_feat = self.scorer.compute_text_feature(instruction)
+
+        remaining = [i for i in range(len(history)) if i not in uniform_indices]
+        rel_ranked = []
+        for idx in remaining:
+            frame_meta = meta_list[idx] if idx < len(meta_list) else None
+            rel = self.scorer.relevance_instruction_only(
+                idx=idx,
+                num_candidates=len(history),
+                instruction=instruction,
+                frame_meta=frame_meta,
+                query_text_feat=query_text_feat,
+            )
+            rel_ranked.append((rel, idx))
+        rel_ranked.sort(key=lambda x: x[0], reverse=True)
+        rel_indices = [idx for _, idx in rel_ranked[:relevance_k]]
+
+        selected_indices = sorted(set(uniform_indices + rel_indices))
+        if len(selected_indices) > target_hist_slots:
+            # Prefer keeping the initial anchor and relevance picks.
+            keep = {0}
+            keep.update(rel_indices)
+            tail_uniform = [i for i in uniform_indices if i not in keep]
+            while len(keep) < target_hist_slots and len(tail_uniform) > 0:
+                keep.add(tail_uniform.pop())
+            selected_indices = sorted(keep)
+
+        if len(selected_indices) < target_hist_slots:
+            for i in range(len(history)):
+                if i not in selected_indices:
+                    selected_indices.append(i)
+                if len(selected_indices) >= target_hist_slots:
+                    break
+            selected_indices = sorted(selected_indices)
+
+        selected_history = [history[i] for i in selected_indices[:target_hist_slots]]
+        while len(selected_history) < target_hist_slots:
+            selected_history.insert(0, Image.new("RGB", (width, height), color=(0, 0, 0)))
+
+        final_frames = selected_history + [current_frame]
+        debug_info = {
+            "strategy": self.strategy_name,
+            "fallback": None,
+            "selected_indices": selected_indices[:target_hist_slots],
+            "uniform_indices": uniform_indices,
+            "relevance_indices": rel_indices,
+            "query_source": "instruction",
+            "relevance_query": instruction,
+            "parser_source": self.parser_source,
+            "uniform_target": desired_uniform,
+            "relevance_target": desired_relevance,
+            "uniform_used": len(uniform_indices),
+            "relevance_used": len(rel_indices),
             "state": self.state_tracker.as_dict(),
             "trace": self.state_tracker.get_trace_text(),
         }

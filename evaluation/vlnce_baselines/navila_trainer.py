@@ -298,13 +298,15 @@ class NaVILATrainer(BaseVLNCETrainer):
         force_stop_max_steps = max(1, int(getattr(config.INFERENCE, "FORCE_STOP_MAX_STEPS", 30)))
         episode_step_count = 0
         last_episode_id = None
-        use_candidate_a = bool(memory_cfg.ENABLE and memory_cfg.STRATEGY == "candidate_a")
+        use_selective_memory = bool(
+            memory_cfg.ENABLE and str(memory_cfg.STRATEGY) in {"candidate_a", "candidate_b_v1"}
+        )
         stop_streak = 0
         last_distance_to_goal = None
 
-        if use_candidate_a:
+        if use_selective_memory:
             memory_manager = CandidateAMemoryManager(memory_cfg)
-            logger.info("Candidate A memory manager enabled.")
+            logger.info(f"Selective memory manager enabled. strategy={memory_cfg.STRATEGY}")
         else:
             logger.info("Using baseline uniform memory sampler.")
 
@@ -395,7 +397,11 @@ class NaVILATrainer(BaseVLNCETrainer):
                         f"Analyze this series of images to decide your next action, which could be turning left or right by a specific "
                         f"degree, moving forward a certain distance, or stop if the task is completed."
                     )
-                    if memory_manager is not None and bool(getattr(memory_cfg, "ENABLE_TRACE_IN_PROMPT", False)):
+                    if (
+                        memory_manager is not None
+                        and str(getattr(memory_cfg, "STRATEGY", "")) != "candidate_b_v1"
+                        and bool(getattr(memory_cfg, "ENABLE_TRACE_IN_PROMPT", False))
+                    ):
                         trace_text = memory_manager.state_tracker.get_trace_text()
                         if trace_text:
                             question += f" Current navigation trace: {trace_text}."

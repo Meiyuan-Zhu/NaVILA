@@ -146,6 +146,28 @@ class FrameScorer:
             rel = 0.7 * visual_rel + 0.1 * recency + 0.2 * text_rel
         return float(max(0.0, min(1.0, rel)))
 
+    def relevance_instruction_only(
+        self,
+        idx: int,
+        num_candidates: int,
+        instruction: str,
+        frame_meta: Optional[Dict[str, float]] = None,
+        query_text_feat: Optional[np.ndarray] = None,
+    ) -> float:
+        """Instruction-only relevance for Candidate B v1.
+
+        Uses text intent similarity only, intentionally ignoring visual similarity and recency.
+        """
+        if query_text_feat is None:
+            query_text_feat = self.compute_text_feature(instruction)
+        frame_text_feat = self._frame_intent_feature(
+            idx=idx,
+            num_candidates=num_candidates,
+            frame_meta=frame_meta,
+        )
+        rel = self._cosine_to_unit_interval(self.cosine(query_text_feat, frame_text_feat))
+        return float(max(0.0, min(1.0, rel)))
+
     def novelty(self, feat: np.ndarray, selected_feats: Sequence[np.ndarray]) -> float:
         if len(selected_feats) == 0:
             return 1.0
