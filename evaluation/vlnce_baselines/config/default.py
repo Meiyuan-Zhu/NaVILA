@@ -57,7 +57,8 @@ _C.INFERENCE.FORCE_STOP_MAX_STEPS = 100
 # ----------------------------------------------------------------------------
 _C.MEMORY = CN()
 _C.MEMORY.ENABLE = False
-_C.MEMORY.STRATEGY = "uniform"  # options: uniform, candidate_a
+_C.MEMORY.STRATEGY = "uniform"  # options: uniform, candidate_a, candidate_b_v1, candidate_b_v2
+_C.MEMORY.NUM_VIDEO_FRAMES_OVERRIDE = -1
 _C.MEMORY.ENABLE_CANDIDATE_A_LITE_V2 = True
 _C.MEMORY.BUDGET_K = 8
 _C.MEMORY.LOG_SELECTED_FRAMES = True

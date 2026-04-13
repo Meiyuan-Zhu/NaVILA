@@ -46,8 +46,11 @@ class CandidateAMemoryManager:
         )
         self.min_frame_gap = max(0, int(getattr(memory_cfg, "MIN_FRAME_GAP", 0)))
         self.enable_stage_aware_routing = bool(getattr(memory_cfg, "ENABLE_STAGE_AWARE_ROUTING", False))
-        if str(getattr(memory_cfg, "STRATEGY", "candidate_a")) == "candidate_b_v1":
+        strategy_cfg = str(getattr(memory_cfg, "STRATEGY", "candidate_a"))
+        if strategy_cfg == "candidate_b_v1":
             self.strategy_name = "candidate_b_v1"
+        elif strategy_cfg == "candidate_b_v2":
+            self.strategy_name = "candidate_b_v2"
         else:
             self.strategy_name = (
                 "candidate_a_lite_v2" if bool(getattr(memory_cfg, "ENABLE_CANDIDATE_A_LITE_V2", False)) else "candidate_a"
@@ -120,6 +123,15 @@ class CandidateAMemoryManager:
 
         if self.strategy_name == "candidate_b_v1":
             return self._select_frames_candidate_b_v1(
+                history_frames=history_frames,
+                current_frame=current_frame,
+                instruction=instruction,
+                num_frames=num_frames,
+                width=width,
+                height=height,
+            )
+        if self.strategy_name == "candidate_b_v2":
+            return self._select_frames_candidate_b_v2(
                 history_frames=history_frames,
                 current_frame=current_frame,
                 instruction=instruction,
@@ -378,6 +390,71 @@ class CandidateAMemoryManager:
             "relevance_target": desired_relevance,
             "uniform_used": len(uniform_indices),
             "relevance_used": len(rel_indices),
+            "state": self.state_tracker.as_dict(),
+            "trace": self.state_tracker.get_trace_text(),
+        }
+        return final_frames, debug_info
+
+    def _select_frames_candidate_b_v2(
+        self,
+        history_frames: List[Image.Image],
+        current_frame: Image.Image,
+        instruction: str,
+        num_frames: int,
+        width: int = 512,
+        height: int = 512,
+    ) -> Tuple[List[Image.Image], Dict[str, object]]:
+        history = list(history_frames)
+        max_hist_frames = int(self.cfg.BUFFER.MAX_HISTORY_FRAMES)
+        if len(history) > max_hist_frames:
+            history = history[-max_hist_frames:]
+
+        if num_frames is None or num_frames <= 1:
+            return [current_frame], {"strategy": self.strategy_name, "selected_indices": []}
+
+        target_hist_slots = max(1, int(num_frames) - 1)
+        initial_target = min(8, target_hist_slots)
+        historical_target = max(0, target_hist_slots - initial_target)
+
+        initial_indices = list(range(min(len(history), initial_target)))
+
+        historical_indices: List[int] = []
+        tail_start = initial_target
+        if historical_target > 0 and len(history) > tail_start:
+            tail_indices = list(range(tail_start, len(history)))
+            if len(tail_indices) <= historical_target:
+                historical_indices = tail_indices
+            else:
+                sampled_tail = np.linspace(0, len(tail_indices) - 1, num=historical_target, dtype=int).tolist()
+                historical_indices = sorted(set(tail_indices[i] for i in sampled_tail))
+                while len(historical_indices) < historical_target:
+                    for idx in tail_indices:
+                        if idx not in historical_indices:
+                            historical_indices.append(idx)
+                        if len(historical_indices) >= historical_target:
+                            break
+                historical_indices = sorted(historical_indices[:historical_target])
+
+        selected_indices = sorted(initial_indices + historical_indices)
+
+        selected_history = [history[i] for i in selected_indices[:target_hist_slots]]
+        while len(selected_history) < target_hist_slots:
+            selected_history.insert(0, Image.new("RGB", (width, height), color=(0, 0, 0)))
+
+        final_frames = selected_history + [current_frame]
+        debug_info = {
+            "strategy": self.strategy_name,
+            "fallback": None,
+            "selected_indices": selected_indices[:target_hist_slots],
+            "initial_indices": initial_indices,
+            "historical_indices": historical_indices,
+            "initial_target": initial_target,
+            "historical_target": historical_target,
+            "initial_used": len(initial_indices),
+            "historical_used": len(historical_indices),
+            "query_source": "instruction",
+            "relevance_query": instruction,
+            "parser_source": self.parser_source,
             "state": self.state_tracker.as_dict(),
             "trace": self.state_tracker.get_trace_text(),
         }

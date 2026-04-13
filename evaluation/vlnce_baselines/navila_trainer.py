@@ -118,6 +118,16 @@ def _format_memory_debug(step_id, episode_id, debug_info, include_scores=True):
             )
         if detail_chunks:
             parts.append("scores={" + " | ".join(detail_chunks) + "}")
+
+    if "initial_indices" in debug_info:
+        parts.append(
+            "segments={initial:%s,historical:%s} targets={initial:%s,historical:%s}" % (
+                debug_info.get("initial_indices", []),
+                debug_info.get("historical_indices", []),
+                int(debug_info.get("initial_target", 0)),
+                int(debug_info.get("historical_target", 0)),
+            )
+        )
     return " ".join(parts)
 
 
@@ -299,7 +309,7 @@ class NaVILATrainer(BaseVLNCETrainer):
         episode_step_count = 0
         last_episode_id = None
         use_selective_memory = bool(
-            memory_cfg.ENABLE and str(memory_cfg.STRATEGY) in {"candidate_a", "candidate_b_v1"}
+            memory_cfg.ENABLE and str(memory_cfg.STRATEGY) in {"candidate_a", "candidate_b_v1", "candidate_b_v2"}
         )
         stop_streak = 0
         last_distance_to_goal = None
@@ -347,7 +357,11 @@ class NaVILATrainer(BaseVLNCETrainer):
                     curr_rgb = Image.fromarray(np.uint8(batch[0]["rgb"].cpu().numpy())).convert("RGB")
 
                     num_video_frames = model.config.num_video_frames
+                    num_video_frames_override = int(getattr(memory_cfg, "NUM_VIDEO_FRAMES_OVERRIDE", -1))
+                    if num_video_frames_override > 1:
+                        num_video_frames = num_video_frames_override
                     instruction = current_episodes[0].instruction.instruction_text
+                    memory_debug = None
 
                     if memory_manager is not None:
                         if current_episode_id != episode_id:
@@ -401,12 +415,28 @@ class NaVILATrainer(BaseVLNCETrainer):
                     frame_length = len(past_and_current_rgbs)
                     print(f"input frame length {frame_length}")
 
-                    question = (
-                        f"Imagine you are a robot programmed for navigation tasks. You have been given a video "
-                        f'of historical observations {interleaved_images}, and current observation <image>\n. Your assigned task is: "{instruction}" '
-                        f"Analyze this series of images to decide your next action, which could be turning left or right by a specific "
-                        f"degree, moving forward a certain distance, or stop if the task is completed."
-                    )
+                    strategy_name = str(getattr(memory_cfg, "STRATEGY", ""))
+                    if strategy_name == "candidate_b_v2" and memory_debug is not None:
+                        history_frame_count = max(0, len(past_and_current_rgbs) - 1)
+                        initial_count = int(memory_debug.get("initial_used", min(8, history_frame_count)))
+                        initial_count = max(0, min(initial_count, history_frame_count))
+                        historical_count = max(0, history_frame_count - initial_count)
+                        initial_images = "<image>\n" * initial_count
+                        historical_images = "<image>\n" * historical_count
+                        question = (
+                            f"Imagine you are a robot programmed for navigation tasks. You have been given a video "
+                            f"of initial frames at the beginning of the episode {initial_images}, video of historical observations {historical_images}, and current observation <image>\n. "
+                            f'Your assigned task is: "{instruction}" '
+                            f"Analyze this series of images to decide your next action, which could be turning left or right by a specific "
+                            f"degree, moving forward a certain distance, or stop if the task is completed."
+                        )
+                    else:
+                        question = (
+                            f"Imagine you are a robot programmed for navigation tasks. You have been given a video "
+                            f'of historical observations {interleaved_images}, and current observation <image>\n. Your assigned task is: "{instruction}" '
+                            f"Analyze this series of images to decide your next action, which could be turning left or right by a specific "
+                            f"degree, moving forward a certain distance, or stop if the task is completed."
+                        )
                     if (
                         memory_manager is not None
                         and str(getattr(memory_cfg, "STRATEGY", "")) != "candidate_b_v1"
