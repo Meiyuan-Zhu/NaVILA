@@ -29,6 +29,7 @@ from vlnce_baselines.common.base_il_trainer import BaseVLNCETrainer
 from vlnce_baselines.common.env_utils import construct_envs, construct_envs_auto_reset_false
 from vlnce_baselines.common.utils import extract_instruction_tokens
 from vlnce_baselines.memory_modules import CandidateAMemoryManager
+from vlnce_baselines.memory_modules.stage_tracker import StageTracker
 
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import SeparatorStyle, conv_templates
@@ -141,6 +142,25 @@ def _extract_distance_to_goal(info):
         return float(val)
     except Exception:
         return None
+
+
+def _format_stage_tracker_debug(episode_id, step_id, payload, recent_actions):
+    return (
+        "[StageTracker][ep={ep}][step={step}] prev_stage={prev} current_stage={cur} "
+        "confidence={conf:.3f} validity={valid} allowed=[{amin},{amax}] "
+        "recent_actions={actions} evidence={ev}"
+    ).format(
+        ep=episode_id,
+        step=step_id,
+        prev=int(payload.get("previous_stage_id", 0)),
+        cur=int(payload.get("current_stage_id", 0)),
+        conf=float(payload.get("confidence", 0.0)),
+        valid=str(payload.get("validity", "unknown")),
+        amin=int(payload.get("allowed_min", 0)),
+        amax=int(payload.get("allowed_max", 0)),
+        actions=list(recent_actions or []),
+        ev=str(payload.get("evidence", "")),
+    )
 
 
 def _apply_stop_guard(stop_guard_cfg, raw_action, stop_streak, last_distance_to_goal, memory_manager):
@@ -309,14 +329,24 @@ class NaVILATrainer(BaseVLNCETrainer):
         episode_step_count = 0
         last_episode_id = None
         use_selective_memory = bool(
-            memory_cfg.ENABLE and str(memory_cfg.STRATEGY) in {"candidate_a", "candidate_b_v1", "candidate_b_v2"}
+            memory_cfg.ENABLE
+            and str(memory_cfg.STRATEGY) in {"candidate_a", "candidate_b_v1", "candidate_b_v2", "candidate_b_v3"}
         )
+        stage_tracker = None
         stop_streak = 0
         last_distance_to_goal = None
 
         if use_selective_memory:
             memory_manager = CandidateAMemoryManager(memory_cfg)
             logger.info(f"Selective memory manager enabled. strategy={memory_cfg.STRATEGY}")
+            if str(memory_cfg.STRATEGY) == "candidate_b_v3" and bool(getattr(memory_cfg.STAGE_TRACKER, "ENABLE", True)):
+                stage_tracker = StageTracker(
+                    interval=int(getattr(memory_cfg.STAGE_TRACKER, "INTERVAL", 10)),
+                    max_stage_delta=int(getattr(memory_cfg.STAGE_TRACKER, "MAX_STAGE_DELTA", 1)),
+                    confidence_threshold=float(getattr(memory_cfg.STAGE_TRACKER, "CONFIDENCE_THRESHOLD", 0.0)),
+                    max_evidence_chars=int(getattr(memory_cfg.STAGE_TRACKER, "MAX_EVIDENCE_CHARS", 180)),
+                )
+                logger.info("Stage tracker enabled for candidate_b_v3.")
         else:
             logger.info("Using baseline uniform memory sampler.")
 
@@ -366,6 +396,8 @@ class NaVILATrainer(BaseVLNCETrainer):
                     if memory_manager is not None:
                         if current_episode_id != episode_id:
                             memory_manager.reset_episode(episode_id=episode_id, instruction=instruction)
+                            if stage_tracker is not None:
+                                stage_tracker.reset(memory_manager.state_tracker.subgoals)
                             subgoals = list(getattr(memory_manager.state_tracker, "subgoals", []) or [])
                             if len(subgoals) > 0:
                                 subgoal_text = " | ".join(
@@ -384,6 +416,74 @@ class NaVILATrainer(BaseVLNCETrainer):
                                 instruction=instruction,
                                 num_frames=num_video_frames,
                             )
+
+                            if stage_tracker is not None and stage_tracker.should_infer(memory_manager.step_id):
+                                previous_stage_id = int(memory_manager.state_tracker.current_subgoal_id)
+                                stage_question = stage_tracker.build_prompt(
+                                    previous_stage_id=previous_stage_id,
+                                    recent_actions=list(memory_manager.state_tracker.recent_actions),
+                                )
+                                stage_conv = conv_templates["llama_3"].copy()
+                                stage_conv.append_message(
+                                    stage_conv.roles[0],
+                                    "Current observation <image>\n" + stage_question,
+                                )
+                                stage_conv.append_message(stage_conv.roles[1], None)
+                                stage_prompt = stage_conv.get_prompt()
+
+                                stage_images_tensor = process_images([curr_rgb], image_processor, model.config).to(
+                                    model.device, dtype=torch.float16
+                                )
+                                stage_input_ids = (
+                                    tokenizer_image_token(
+                                        stage_prompt,
+                                        tokenizer,
+                                        IMAGE_TOKEN_INDEX,
+                                        return_tensors="pt",
+                                    )
+                                    .unsqueeze(0)
+                                    .cuda()
+                                )
+                                stage_stop_str = (
+                                    stage_conv.sep if stage_conv.sep_style != SeparatorStyle.TWO else stage_conv.sep2
+                                )
+                                stage_stopping_criteria = KeywordsStoppingCriteria(
+                                    [stage_stop_str], tokenizer, stage_input_ids
+                                )
+                                with torch.inference_mode():
+                                    stage_output_ids = model.generate(
+                                        stage_input_ids,
+                                        images=stage_images_tensor.half().cuda(),
+                                        do_sample=False,
+                                        temperature=0.0,
+                                        max_new_tokens=96,
+                                        use_cache=True,
+                                        stopping_criteria=[stage_stopping_criteria],
+                                        pad_token_id=tokenizer.eos_token_id,
+                                    )
+                                stage_outputs = tokenizer.batch_decode(
+                                    stage_output_ids, skip_special_tokens=True
+                                )[0].strip()
+                                if stage_outputs.endswith(stage_stop_str):
+                                    stage_outputs = stage_outputs[: -len(stage_stop_str)]
+                                stage_payload = stage_tracker.parse_response(
+                                    text=stage_outputs.strip(),
+                                    previous_stage_id=previous_stage_id,
+                                )
+                                memory_manager.state_tracker.set_stage(
+                                    stage_id=int(stage_payload["current_stage_id"]),
+                                    confidence=float(stage_payload["confidence"]),
+                                    evidence=str(stage_payload["evidence"]),
+                                )
+                                logger.info(
+                                    _format_stage_tracker_debug(
+                                        episode_id=episode_id,
+                                        step_id=memory_manager.step_id,
+                                        payload=stage_payload,
+                                        recent_actions=list(memory_manager.state_tracker.recent_actions),
+                                    )
+                                )
+
                             should_log = bool(memory_cfg.LOG_SELECTED_FRAMES) and (
                                 memory_manager.step_id == 1
                                 or (memory_manager.step_id % max(1, int(memory_cfg.LOG_INTERVAL)) == 0)
@@ -416,7 +516,7 @@ class NaVILATrainer(BaseVLNCETrainer):
                     print(f"input frame length {frame_length}")
 
                     strategy_name = str(getattr(memory_cfg, "STRATEGY", ""))
-                    if strategy_name == "candidate_b_v2" and memory_debug is not None:
+                    if strategy_name in {"candidate_b_v2", "candidate_b_v3"} and memory_debug is not None:
                         history_frame_count = max(0, len(past_and_current_rgbs) - 1)
                         initial_count = int(memory_debug.get("initial_used", min(8, history_frame_count)))
                         initial_count = max(0, min(initial_count, history_frame_count))

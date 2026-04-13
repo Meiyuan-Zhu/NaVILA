@@ -13,6 +13,8 @@ class StateTracker:
         self.current_subgoal_id = 0
         self.completed_subgoal_ids = set()
         self.last_milestone_text = ""
+        self.last_stage_confidence = 0.0
+        self.last_stage_evidence = ""
         self.recent_actions: Deque[int] = deque(maxlen=max_actions)
 
     def reset(self, subgoals: List[str]):
@@ -20,9 +22,17 @@ class StateTracker:
         self.current_subgoal_id = 0
         self.completed_subgoal_ids = set()
         self.last_milestone_text = ""
+        self.last_stage_confidence = 0.0
+        self.last_stage_evidence = ""
         self.recent_actions.clear()
 
-    def update(self, action_id: int, yaw_delta: Optional[float] = None, cue: Optional[str] = None):
+    def update(
+        self,
+        action_id: int,
+        yaw_delta: Optional[float] = None,
+        cue: Optional[str] = None,
+        allow_stage_advance: bool = True,
+    ):
         if action_id is None:
             return
 
@@ -30,12 +40,13 @@ class StateTracker:
         abs_turn = abs(float(yaw_delta)) if yaw_delta is not None else 0.0
 
         should_advance = False
-        if abs_turn >= self.turn_threshold_deg:
-            should_advance = True
-            self.last_milestone_text = "turn"
-        elif cue:
-            should_advance = True
-            self.last_milestone_text = cue
+        if allow_stage_advance:
+            if abs_turn >= self.turn_threshold_deg:
+                should_advance = True
+                self.last_milestone_text = "turn"
+            elif cue:
+                should_advance = True
+                self.last_milestone_text = cue
 
         if should_advance and self.subgoals:
             if self.current_subgoal_id < len(self.subgoals) - 1:
@@ -47,8 +58,20 @@ class StateTracker:
             "current_subgoal_id": self.current_subgoal_id,
             "completed_subgoal_ids": sorted(list(self.completed_subgoal_ids)),
             "last_milestone_text": self.last_milestone_text,
+            "last_stage_confidence": self.last_stage_confidence,
+            "last_stage_evidence": self.last_stage_evidence,
             "recent_actions": list(self.recent_actions),
         }
+
+    def set_stage(self, stage_id: int, confidence: float = 0.0, evidence: str = ""):
+        if len(self.subgoals) > 0:
+            bounded = max(0, min(int(stage_id), len(self.subgoals) - 1))
+        else:
+            bounded = max(0, int(stage_id))
+        self.current_subgoal_id = bounded
+        self.completed_subgoal_ids = set(range(max(0, bounded)))
+        self.last_stage_confidence = max(0.0, min(1.0, float(confidence)))
+        self.last_stage_evidence = str(evidence or "").strip()
 
     def get_trace_text(self) -> str:
         if not self.use_trace:

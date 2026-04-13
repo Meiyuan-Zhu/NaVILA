@@ -1,0 +1,13 @@
+{
+  "subgoals": [
+    "walk into the kitchen area",
+    "walk by the sink",
+    "oven",
+    "walk straight into the hallway",
+    "turn right into the little room",
+    "turn left",
+    "walk into the bedroom",
+    "stop by the corner of the bed"
+  ],
+  "source": "rule"
+}

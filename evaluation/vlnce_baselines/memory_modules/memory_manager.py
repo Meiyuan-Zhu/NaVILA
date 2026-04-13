@@ -51,6 +51,8 @@ class CandidateAMemoryManager:
             self.strategy_name = "candidate_b_v1"
         elif strategy_cfg == "candidate_b_v2":
             self.strategy_name = "candidate_b_v2"
+        elif strategy_cfg == "candidate_b_v3":
+            self.strategy_name = "candidate_b_v3"
         else:
             self.strategy_name = (
                 "candidate_a_lite_v2" if bool(getattr(memory_cfg, "ENABLE_CANDIDATE_A_LITE_V2", False)) else "candidate_a"
@@ -76,7 +78,11 @@ class CandidateAMemoryManager:
 
     def update_after_action(self, action_id: int, turn_deg: float = 0.0, yaw_delta: Optional[float] = None):
         turn_value = float(yaw_delta) if yaw_delta is not None else float(turn_deg)
-        self.state_tracker.update(action_id=action_id, yaw_delta=turn_value)
+        self.state_tracker.update(
+            action_id=action_id,
+            yaw_delta=turn_value,
+            allow_stage_advance=(self.strategy_name != "candidate_b_v3"),
+        )
         self.frame_meta.append(
             {
                 "action": int(action_id),
@@ -131,6 +137,15 @@ class CandidateAMemoryManager:
                 height=height,
             )
         if self.strategy_name == "candidate_b_v2":
+            return self._select_frames_candidate_b_v2(
+                history_frames=history_frames,
+                current_frame=current_frame,
+                instruction=instruction,
+                num_frames=num_frames,
+                width=width,
+                height=height,
+            )
+        if self.strategy_name == "candidate_b_v3":
             return self._select_frames_candidate_b_v2(
                 history_frames=history_frames,
                 current_frame=current_frame,
