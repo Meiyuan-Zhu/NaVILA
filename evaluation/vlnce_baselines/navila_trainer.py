@@ -338,8 +338,27 @@ class NaVILATrainer(BaseVLNCETrainer):
                 config.RESULTS_DIR,
                 f"{split}_{self.num_chunks}-{self.chunk_idx}.json",
             )
+            preloaded_stats = {}
             if os.path.exists(fname):
-                logger.info("skipping -- evaluation exists.")
+                try:
+                    with open(fname, "r") as f:
+                        preloaded_stats = json.load(f)
+                    logger.info(
+                        f"resume enabled -- loaded {len(preloaded_stats)} episodes from existing results: {fname}"
+                    )
+                except Exception as exc:
+                    logger.warning(f"failed to load existing results from {fname}: {exc}; starting fresh.")
+                    preloaded_stats = {}
+            def _flush_partial_results() -> None:
+                tmp_fname = f"{fname}.tmp"
+                with open(tmp_fname, "w") as f:
+                    json.dump(stats_episodes, f, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_fname, fname)
+        else:
+            preloaded_stats = {}
+            def _flush_partial_results() -> None:
                 return
 
         envs = construct_envs_auto_reset_false(config, get_env_class(config.ENV_NAME))
@@ -348,7 +367,7 @@ class NaVILATrainer(BaseVLNCETrainer):
         batch = batch_obs(observations, self.device)
         batch = apply_obs_transforms_batch(batch, self.obs_transforms)
 
-        stats_episodes = {}
+        stats_episodes = dict(preloaded_stats)
 
         past_rgbs = [[] for _ in range(envs.num_envs)]
         rgb_frames = [[] for _ in range(envs.num_envs)]  # this is for visualization, contains text and map
@@ -360,7 +379,7 @@ class NaVILATrainer(BaseVLNCETrainer):
         if config.EVAL.EPISODE_COUNT > -1:
             num_eps = min(config.EVAL.EPISODE_COUNT, num_eps)
 
-        pbar = tqdm.tqdm(total=num_eps) if config.use_pbar else None
+        pbar = tqdm.tqdm(total=num_eps, initial=min(len(stats_episodes), num_eps)) if config.use_pbar else None
         log_str = (
             f"[Ckpt: {checkpoint_path}]" " [Episodes evaluated: {evaluated}/{total}]" " [Time elapsed (s): {time}]"
         )
@@ -856,8 +875,11 @@ class NaVILATrainer(BaseVLNCETrainer):
                         metrics={"spl": stats_episodes[ep_id]["spl"]},
                         tb_writer=writer,
                     )
-                    del stats_episodes[ep_id]["top_down_map_vlnce"]
                     rgb_frames[i] = []
+
+                # Keep per-episode payload JSON-safe and flush immediately so partial progress survives interrupts.
+                stats_episodes[ep_id].pop("top_down_map_vlnce", None)
+                _flush_partial_results()
 
             observations = extract_instruction_tokens(
                 observations,
@@ -885,8 +907,7 @@ class NaVILATrainer(BaseVLNCETrainer):
             pbar.close()
 
         if config.EVAL.SAVE_RESULTS:
-            with open(fname, "w") as f:
-                json.dump(stats_episodes, f, indent=4)
+            _flush_partial_results()
 
     @staticmethod
     def _pause_envs(

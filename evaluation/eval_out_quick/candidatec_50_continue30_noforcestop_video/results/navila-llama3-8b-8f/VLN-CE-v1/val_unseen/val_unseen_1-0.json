@@ -1,0 +1,194 @@
+{
+    "4": {
+        "success": 1.0,
+        "spl": 0.88,
+        "oracle_spl": 0.88,
+        "inferred_from_video_filename": true
+    },
+    "5": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "6": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "7": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "8": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "9": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "10": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "11": {
+        "success": 1.0,
+        "spl": 0.87,
+        "oracle_spl": 0.87,
+        "inferred_from_video_filename": true
+    },
+    "12": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "16": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "17": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "18": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "19": {
+        "success": 1.0,
+        "spl": 0.58,
+        "oracle_spl": 0.58,
+        "inferred_from_video_filename": true
+    },
+    "20": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "21": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "22": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "23": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "24": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "28": {
+        "distance_to_goal": 10.971850395202637,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.270094123830633,
+        "path_length": 22.24359955638647,
+        "oracle_success": 0.0,
+        "steps_taken": 500.0,
+        "oracle_spl": 0.0
+    },
+    "29": {
+        "distance_to_goal": 8.873346328735352,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.4901964291663495,
+        "path_length": 12.987336937338114,
+        "oracle_success": 0.0,
+        "steps_taken": 205.0,
+        "oracle_spl": 0.0
+    },
+    "30": {
+        "distance_to_goal": 10.88708782196045,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.341320042135706,
+        "path_length": 6.737881273031235,
+        "oracle_success": 0.0,
+        "steps_taken": 58.0,
+        "oracle_spl": 0.0
+    },
+    "31": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "32": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "33": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "34": {
+        "success": 1.0,
+        "spl": 1.0,
+        "oracle_spl": 1.0,
+        "inferred_from_video_filename": true
+    },
+    "35": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "36": {
+        "success": 1.0,
+        "spl": 0.49,
+        "oracle_spl": 0.49,
+        "inferred_from_video_filename": true
+    },
+    "43": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "44": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    },
+    "45": {
+        "success": 0.0,
+        "spl": 0.0,
+        "oracle_spl": 0.0,
+        "inferred_from_video_filename": true
+    }
+}

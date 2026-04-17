@@ -1,0 +1,32 @@
+{
+    "28": {
+        "distance_to_goal": 10.971850395202637,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.270094123830633,
+        "path_length": 22.24359955638647,
+        "oracle_success": 0.0,
+        "steps_taken": 500.0,
+        "oracle_spl": 0.0
+    },
+    "29": {
+        "distance_to_goal": 8.873346328735352,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.4901964291663495,
+        "path_length": 12.987336937338114,
+        "oracle_success": 0.0,
+        "steps_taken": 205.0,
+        "oracle_spl": 0.0
+    },
+    "30": {
+        "distance_to_goal": 10.88708782196045,
+        "success": 0.0,
+        "spl": 0.0,
+        "ndtw": 0.341320042135706,
+        "path_length": 6.737881273031235,
+        "oracle_success": 0.0,
+        "steps_taken": 58.0,
+        "oracle_spl": 0.0
+    }
+}
