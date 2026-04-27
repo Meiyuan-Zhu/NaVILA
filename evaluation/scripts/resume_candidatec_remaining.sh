@@ -6,6 +6,18 @@ conda activate navila-eval
 
 cd /home/lmgroup-intern/workspace/NaVILA/evaluation
 
+# Headless Habitat-Sim uses EGL; keep this consistent with the official eval script.
+unset DISPLAY
+export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-$HOME/nvidia-egl.json}
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+export EGL_LOG_LEVEL=${EGL_LOG_LEVEL:-error}
+export PYTHONFAULTHANDLER=1
+
+GPU_ID=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | sort -t, -k2n | head -n1 | cut -d, -f1 | tr -d ' ')
+if [[ -z "${GPU_ID}" ]]; then
+  GPU_ID=0
+fi
+
 EPISODES_ALLOWED=$(python - <<'PY'
 import json
 from pathlib import Path
@@ -37,8 +49,12 @@ fi
 
 echo "Resuming candidate_c with EPISODE_COUNT=$EPISODE_COUNT"
 echo "EPISODES_ALLOWED=$EPISODES_ALLOWED"
+echo "Using GPU_ID=$GPU_ID"
 
 python run.py --run-type eval --exp-config vlnce_baselines/config/r2r_baselines/navila.yaml \
+  TORCH_GPU_ID "$GPU_ID" \
+  SIMULATOR_GPU_IDS "[$GPU_ID]" \
+  TASK_CONFIG.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID "$GPU_ID" \
   EVAL_CKPT_PATH_DIR /home/lmgroup-intern/workspace/models/navila-llama3-8b-8f \
   EVAL.SPLIT val_unseen \
   EVAL.EPISODE_COUNT "$EPISODE_COUNT" \

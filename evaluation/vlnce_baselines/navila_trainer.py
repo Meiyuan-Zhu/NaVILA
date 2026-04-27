@@ -301,13 +301,25 @@ class NaVILATrainer(BaseVLNCETrainer):
 
         # build model
         model_name = os.path.basename(os.path.normpath(checkpoint_path))
-        tokenizer, model, image_processor, context_len = load_pretrained_model(checkpoint_path, model_name)
+        model_device_str = f"cuda:{self.config.TORCH_GPU_ID}" if torch.cuda.is_available() else "cpu"
+        tokenizer, model, image_processor, context_len = load_pretrained_model(
+            checkpoint_path,
+            model_name,
+            device=model_device_str,
+        )
+        target_device = (
+            torch.device("cuda", self.config.TORCH_GPU_ID) if torch.cuda.is_available() else torch.device("cpu")
+        )
         try:
-            model = model.cuda()
+            model = model.to(target_device)
         except NotImplementedError:
             # Some loaders dispatch weights with accelerate/device_map and keep meta placeholders.
             # In that case forcing .cuda() fails; keep the dispatched placement.
             logger.info("Skip model.cuda(); using pre-dispatched model placement.")
+        except RuntimeError as exc:
+            if "out of memory" in str(exc).lower():
+                logger.error(f"Failed to move model to {target_device}: {exc}")
+            raise
 
         config = self.config.clone()
         split = config.EVAL.SPLIT
@@ -375,9 +387,13 @@ class NaVILATrainer(BaseVLNCETrainer):
         if len(config.VIDEO_OPTION) > 0:
             os.makedirs(config.VIDEO_DIR, exist_ok=True)
 
-        num_eps = sum(envs.number_of_episodes)
+        requested_eps = sum(envs.number_of_episodes)
         if config.EVAL.EPISODE_COUNT > -1:
-            num_eps = min(config.EVAL.EPISODE_COUNT, num_eps)
+            requested_eps = min(config.EVAL.EPISODE_COUNT, requested_eps)
+
+        # In resume mode, stats_episodes may already contain historical results.
+        # Treat EVAL.EPISODE_COUNT as the number of episodes to run in this invocation.
+        num_eps = len(preloaded_stats) + requested_eps
 
         pbar = tqdm.tqdm(total=num_eps, initial=min(len(stats_episodes), num_eps)) if config.use_pbar else None
         log_str = (
